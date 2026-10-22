@@ -1,0 +1,19 @@
+# WorkBuddy 本地元数据
+.workbuddy-ai/
+.workbuddy/
+.wbapp_*.genie
+
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 日志
+*.log
+npm-debug.log*
