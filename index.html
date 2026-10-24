@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>NBA 看台 · 关注球员实时数据</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14.5' fill='%23ff7a1a'/%3E%3Cg fill='none' stroke='%231c0d02' stroke-width='1.5'%3E%3Cpath d='M1.5 16h29'/%3E%3Cpath d='M16 1.5c4.2 4.2 4.2 24.8 0 29'/%3E%3Cpath d='M16 1.5c-4.2 4.2-4.2 24.8 0 29'/%3E%3Cpath d='M4 8.2c7.4 2.1 16.6 2.1 24 0'/%3E%3Cpath d='M4 23.8c7.4-2.1 16.6-2.1 24 0'/%3E%3C/g%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -42,6 +43,7 @@
           <button id="todayDate" class="text-btn" title="回到今天的赛程">今天</button>
         </div>
         <div class="action-buttons">
+          <button id="authBtn" class="text-btn auth-btn" title="登录即注册，数据云同步">登录</button>
           <button id="refreshBtn" class="icon-btn" title="立即刷新" aria-label="立即刷新">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
           </button>
@@ -129,7 +131,7 @@
 
     <footer class="foot">
       <span>数据来源：ESPN 公开接口 · 球队技术统计来自现场 box score</span>
-      <span id="refreshHint">每 20 秒自动刷新</span>
+      <span id="refreshHint">每 10 秒自动刷新</span>
     </footer>
   </div>
 
@@ -142,6 +144,20 @@
       <input id="playerSearch" class="search-input" type="search" placeholder="输入中文名或英文名搜索，如 库里、Jaquez" autocomplete="off">
       <p class="search-hint">支持中文译名或英文姓 / 全名，添加后会自动显示中文译名。</p>
       <div id="searchResults" class="search-results"></div>
+    </div>
+  </div>
+
+  <div id="authModal" class="modal" hidden>
+    <div class="modal-card auth-card" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
+      <header class="modal-head">
+        <h2 id="authModalTitle">登录 / 注册</h2>
+        <button id="authModalClose" class="icon-btn" aria-label="关闭">×</button>
+      </header>
+      <p class="search-hint">登录即注册：账号首次使用时自动创建，无需单独注册。登录后关注名单等数据保存在云端，换设备、刷新都不丢。</p>
+      <input id="authUsername" class="search-input auth-field" type="text" placeholder="用户名（2-20 位中文 / 字母 / 数字）" autocomplete="username" maxlength="20">
+      <input id="authPassword" class="search-input auth-field" type="password" placeholder="密码（至少 6 位）" autocomplete="current-password" maxlength="64">
+      <p id="authError" class="auth-error" hidden></p>
+      <button id="authSubmit" class="primary-btn auth-submit">登录 / 自动注册</button>
     </div>
   </div>
 

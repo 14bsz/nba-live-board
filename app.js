@@ -2,20 +2,24 @@
 
 const API = {
   scoreboard: (dates) =>
-    'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard' + (dates ? '?dates=' + dates : ''),
-  summary: (eventId) => 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=' + eventId,
+    '/api/espn/site/apis/site/v2/sports/basketball/nba/scoreboard' + (dates ? '?dates=' + dates : ''),
+  summary: (eventId) => '/api/espn/site/apis/site/v2/sports/basketball/nba/summary?event=' + eventId,
   search: (query) =>
-    'https://site.web.api.espn.com/apis/common/v3/search?query=' +
+    '/api/espn/web/apis/common/v3/search?query=' +
     encodeURIComponent(query) +
     '&type=player&sport=basketball&league=nba',
 };
 
 const STORE_KEY = 'nba-stand-v1';
+const AUTH_TOKEN_KEY = 'nba-stand-auth-token';
+const CLOUD_SYNC_DEBOUNCE_MS = 800;
 const HOT_ALERT_KEY = 'nba-stand-hot-alerts-v1';
 const VIEW_KEY = 'nba-stand-view-v1';
-const REFRESH_SECONDS = 20;
-const HALFTIME_MS = 15 * 60 * 1000;
-const QUARTER_BREAK_MS = 150 * 1000;
+const REFRESH_SECONDS = 10;
+const HALFTIME_MS = 15.5 * 60 * 1000;
+const QUARTER_BREAK_MS = 170 * 1000;
+const BREAK_SAMPLE_MIN_MS = 90 * 1000;
+const BREAK_SAMPLE_MAX_MS = 8 * 60 * 1000;
 const TIMEOUT_VISIBLE_MS = 2 * 60 * 1000;
 const HOT_MIN_MINUTES = 10;
 const HOT_MIN_RULES = 2;
@@ -234,7 +238,7 @@ const HOT_STATS_KEY = 'nba-stand-hot-stats-v1';
 const HOT_THRESHOLD_KEY = 'nba-stand-hot-threshold-v1';
 const DEFAULT_HOT_THRESHOLD = 5;
 const GAMELOG_API = (id, season) =>
-  `https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/${id}/gamelog` +
+  `/api/espn/web/apis/common/v3/sports/basketball/nba/athletes/${id}/gamelog` +
   (season ? `?season=${season}` : '');
 
 const NAME_ZH = {
@@ -635,6 +639,7 @@ const state = {
   hotThreshold: DEFAULT_HOT_THRESHOLD,
   hotStatsLoading: false,
   hotStatsLoaded: false,
+  auth: { token: null, user: null, ready: false },
 };
 
 const el = {};
@@ -698,6 +703,13 @@ async function init() {
   el.rosterModalBody = document.getElementById('rosterModalBody');
   el.toast = document.getElementById('toast');
   el.refreshHint = document.getElementById('refreshHint');
+  el.authBtn = document.getElementById('authBtn');
+  el.authModal = document.getElementById('authModal');
+  el.authModalClose = document.getElementById('authModalClose');
+  el.authUsername = document.getElementById('authUsername');
+  el.authPassword = document.getElementById('authPassword');
+  el.authError = document.getElementById('authError');
+  el.authSubmit = document.getElementById('authSubmit');
 
   state.players = loadPlayers();
   applyImportOnce();
@@ -711,6 +723,7 @@ async function init() {
 
   await refresh();
   loadHotStats();
+  initAuth();
 }
 
 function bindEvents() {
@@ -765,7 +778,8 @@ function bindEvents() {
   });
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
-    if (!el.rosterModal.hidden) closeRosterModal();
+    if (!el.authModal.hidden) closeAuthModal();
+    else if (!el.rosterModal.hidden) closeRosterModal();
     else if (!el.modal.hidden) closeModal();
   });
   el.playerSearch.addEventListener('input', onSearchInput);
@@ -842,6 +856,19 @@ function bindEvents() {
     if (card) revealPlayer(card.dataset.hotPlayer);
   });
 
+  el.authBtn.addEventListener('click', onAuthButtonClick);
+  el.authModalClose.addEventListener('click', closeAuthModal);
+  el.authModal.addEventListener('click', (event) => {
+    if (event.target === el.authModal) closeAuthModal();
+  });
+  el.authSubmit.addEventListener('click', submitAuth);
+  el.authPassword.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') submitAuth();
+  });
+  el.authUsername.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') el.authPassword.focus();
+  });
+
   bindHScroll();
 
   el.emptyState.addEventListener('click', (event) => {
@@ -869,7 +896,7 @@ function bindEvents() {
 const HSCROLL_SELECTOR = '.hotbar-track, .sl-track';
 let hScrollDrag = null;
 
-// 滚轮竖滚转横滚 + 鼠标按住拖拽横滚；两个轨道都会每 20 秒重建，所以用事件委托
+// 滚轮竖滚转横滚 + 鼠标按住拖拽横滚；两个轨道都会每 10 秒重建，所以用事件委托
 function bindHScroll() {
   document.addEventListener(
     'wheel',
@@ -937,6 +964,249 @@ function bindHScroll() {
 
   document.addEventListener('pointerup', endDrag);
   document.addEventListener('pointercancel', endDrag);
+}
+
+/* ---------- 账号：登录即注册 + 云端同步 ---------- */
+
+function loadAuthToken() {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY);
+  } catch (error) {
+    return null;
+  }
+}
+
+function saveAuthToken(token) {
+  try {
+    localStorage.setItem(AUTH_TOKEN_KEY, token);
+  } catch (error) {
+    /* storage may be unavailable */
+  }
+}
+
+function clearAuthToken() {
+  try {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+  } catch (error) {
+    /* ignore */
+  }
+}
+
+/** 带登录态的请求；401 时自动退回本地模式（不清空本机数据） */
+async function authFetch(url, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (options.body) headers['Content-Type'] = 'application/json';
+  let requestUrl = url;
+  if (state.auth.token) {
+    headers.Authorization = 'Bearer ' + state.auth.token;
+    // 部分部署网关会剥离 Authorization，同时用自定义头与查询参数兜底
+    headers['X-Auth-Token'] = state.auth.token;
+    requestUrl = url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(state.auth.token);
+  }
+  const response = await fetch(requestUrl, { ...options, headers });
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 401 && state.auth.token) {
+    clearAuthToken();
+    state.auth.token = null;
+    state.auth.user = null;
+    updateAuthUi();
+  }
+  if (!response.ok) throw new Error(data.error || '请求失败（HTTP ' + response.status + '）');
+  return data;
+}
+
+function collectCloudData() {
+  return {
+    version: STORE_VERSION,
+    players: state.players,
+    hotThreshold: state.hotThreshold,
+    view: state.view,
+    hotAlertStore,
+  };
+}
+
+/** 用云端数据覆盖本机状态；直接写 localStorage，不触发回推，避免同步循环 */
+function applyCloudData(data) {
+  if (!data || typeof data !== 'object') return false;
+  let applied = false;
+
+  if (Array.isArray(data.players)) {
+    state.players = data.players;
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify({ version: STORE_VERSION, players: state.players }));
+    } catch (error) {
+      /* ignore */
+    }
+    applied = true;
+  }
+  if (Number.isFinite(data.hotThreshold) && data.hotThreshold >= 1 && data.hotThreshold <= 30) {
+    state.hotThreshold = data.hotThreshold;
+    try {
+      localStorage.setItem(HOT_THRESHOLD_KEY, String(data.hotThreshold));
+    } catch (error) {
+      /* ignore */
+    }
+    if (el.hotThreshold) el.hotThreshold.value = String(data.hotThreshold);
+    applied = true;
+  }
+  if (data.view === 'teams' || data.view === 'players') {
+    state.view = data.view;
+    try {
+      localStorage.setItem(VIEW_KEY, state.view);
+    } catch (error) {
+      /* ignore */
+    }
+    applied = true;
+  }
+  if (data.hotAlertStore && typeof data.hotAlertStore === 'object' && !Array.isArray(data.hotAlertStore)) {
+    hotAlertStore = data.hotAlertStore;
+    try {
+      localStorage.setItem(HOT_ALERT_KEY, JSON.stringify(hotAlertStore));
+    } catch (error) {
+      /* ignore */
+    }
+    applied = true;
+  }
+  return applied;
+}
+
+async function pushCloudData() {
+  if (!state.auth.token) return;
+  try {
+    await authFetch('/api/data', { method: 'PUT', body: JSON.stringify(collectCloudData()) });
+  } catch (error) {
+    showToast('云端同步失败：' + error.message);
+  }
+}
+
+let cloudSyncTimer = null;
+
+/** 本地数据变更后防抖推送；未登录时只在本地保存 */
+function scheduleCloudSync() {
+  if (!state.auth.token) return;
+  clearTimeout(cloudSyncTimer);
+  cloudSyncTimer = setTimeout(() => {
+    pushCloudData();
+  }, CLOUD_SYNC_DEBOUNCE_MS);
+}
+
+/** 登录后拉取云端数据；云端为空则把本机数据迁移上去 */
+async function pullCloudData() {
+  const result = await authFetch('/api/data');
+  if (result && result.data && Object.keys(result.data).length > 0) {
+    if (applyCloudData(result.data)) {
+      state.rows = buildRows();
+      render();
+      showToast('已从云端恢复关注名单等数据');
+    }
+  } else {
+    await pushCloudData();
+    showToast('本机数据已保存到云端');
+  }
+}
+
+async function initAuth() {
+  const token = loadAuthToken();
+  if (!token) {
+    state.auth.ready = true;
+    updateAuthUi();
+    return;
+  }
+  state.auth.token = token;
+  try {
+    const me = await authFetch('/api/me');
+    state.auth.user = me.user;
+    await pullCloudData();
+  } catch (error) {
+    // token 失效或网络异常：保持本地模式继续使用
+    state.auth.token = null;
+    state.auth.user = null;
+  }
+  state.auth.ready = true;
+  updateAuthUi();
+}
+
+function openAuthModal() {
+  el.authError.hidden = true;
+  el.authModal.hidden = false;
+  document.body.classList.add('modal-open');
+  setTimeout(() => el.authUsername.focus(), 0);
+}
+
+function closeAuthModal() {
+  el.authModal.hidden = true;
+  if (el.modal.hidden && el.rosterModal.hidden) document.body.classList.remove('modal-open');
+}
+
+function showAuthError(message) {
+  el.authError.textContent = message;
+  el.authError.hidden = false;
+}
+
+function onAuthButtonClick() {
+  if (state.auth.user) {
+    const ok = window.confirm(`当前已登录：${state.auth.user.name}\n确定退出登录吗？（本机数据会保留）`);
+    if (ok) logout();
+    return;
+  }
+  openAuthModal();
+}
+
+/** 登录即注册：服务端对不存在的账号自动创建 */
+async function submitAuth() {
+  const username = el.authUsername.value.trim();
+  const password = el.authPassword.value;
+  if (!username || !password) {
+    showAuthError('请输入用户名和密码');
+    return;
+  }
+  el.authSubmit.disabled = true;
+  el.authSubmit.textContent = '登录中…';
+  try {
+    const result = await fetch('/api/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    }).then(async (response) => {
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || '登录失败（HTTP ' + response.status + '）');
+      return data;
+    });
+    state.auth.token = result.token;
+    state.auth.user = result.user;
+    saveAuthToken(result.token);
+    el.authPassword.value = '';
+    closeAuthModal();
+    updateAuthUi();
+    showToast(result.created ? `账号 ${result.user.name} 已创建，欢迎加入` : `欢迎回来，${result.user.name}`);
+    await pullCloudData();
+  } catch (error) {
+    showAuthError(error.message);
+  } finally {
+    el.authSubmit.disabled = false;
+    el.authSubmit.textContent = '登录 / 自动注册';
+  }
+}
+
+async function logout() {
+  try {
+    await authFetch('/api/logout', { method: 'POST' });
+  } catch (error) {
+    /* 退出失败也继续清本地登录态 */
+  }
+  clearAuthToken();
+  state.auth.token = null;
+  state.auth.user = null;
+  updateAuthUi();
+  showToast('已退出登录，数据仍保存在本机');
+}
+
+function updateAuthUi() {
+  if (!el.authBtn) return;
+  const user = state.auth.user;
+  el.authBtn.textContent = user ? user.name : '登录';
+  el.authBtn.title = user ? `已登录：${user.name}（点击退出）` : '登录即注册，数据云同步';
+  el.authBtn.classList.toggle('logged-in', Boolean(user));
 }
 
 /* ---------- data ---------- */
@@ -1050,6 +1320,7 @@ function saveHotThreshold(value) {
   } catch (error) {
     /* ignore */
   }
+  scheduleCloudSync();
 }
 
 function hotStatsFor(id) {
@@ -1201,7 +1472,8 @@ async function loadHotStats(force = false) {
 
   if (todo.length) {
     showToast(`正在统计赛季火热场次（${todo.length} 人）…`);
-    const pool = 6;
+    // 并发池设为 4：浏览器同一域名最多 6 个连接，留 2 个给登录、搜索等交互请求
+    const pool = 4;
     let done = 0;
     let cursor = 0;
     const workers = Array.from({ length: Math.min(pool, todo.length) }, async () => {
@@ -1249,11 +1521,13 @@ function savePlayers() {
   } catch (error) {
     /* storage may be unavailable */
   }
+  scheduleCloudSync();
 }
 
 async function fetchJSON(url) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+  // 25 秒：跨境部署 + 首次无缓存时，单场技术统计的往返可能接近 10 秒
+  const timer = setTimeout(() => controller.abort(), 25000);
   try {
     const response = await fetch(url, { signal: controller.signal, cache: 'no-store' });
     if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -1703,6 +1977,7 @@ function saveHotAlertStore() {
   } catch (error) {
     /* storage may be unavailable */
   }
+  scheduleCloudSync();
 }
 
 function pruneHotAlertStore() {
@@ -1778,6 +2053,28 @@ function leaderForSort(rows) {
   return leadersForSorts(rows).find((item) => item.key === key) || null;
 }
 
+/** 用本场第一节到第二节的实际间隔，估算下一次节间休息时长 */
+function sampleQuarterBreakMs(plays) {
+  const bounds = new Map();
+  for (const play of plays) {
+    const period = play.period?.number;
+    const wall = Date.parse(play.wallclock || '');
+    if (!period || !Number.isFinite(wall)) continue;
+    const entry = bounds.get(period);
+    if (entry) {
+      entry.first = Math.min(entry.first, wall);
+      entry.last = Math.max(entry.last, wall);
+    } else {
+      bounds.set(period, { first: wall, last: wall });
+    }
+  }
+  const first = bounds.get(1);
+  const second = bounds.get(2);
+  if (!first || !second) return 0;
+  const gap = second.first - first.last;
+  return gap >= BREAK_SAMPLE_MIN_MS && gap <= BREAK_SAMPLE_MAX_MS ? gap : 0;
+}
+
 function buildGameMeta(game, summary) {
   const summaryStatus = summary?.header?.competitions?.[0]?.status;
   const statusName = game.statusName || summaryStatus?.type?.name || '';
@@ -1811,15 +2108,16 @@ function buildGameMeta(game, summary) {
     halftimeSeen.delete(game.id);
   }
 
-  // 节间休息按 2 分 30 秒估算结束时间，用于倒计时
+  // 节间休息优先用本场实测的节间时长估算，没有样本时退回默认值
+  const quarterBreakMs = sampleQuarterBreakMs(plays) || QUARTER_BREAK_MS;
   let breakEndsAt = 0;
   if (endPeriod) {
     const wall = Date.parse(lastPlay?.wallclock || '');
     if (Number.isFinite(wall)) {
-      breakEndsAt = wall + QUARTER_BREAK_MS;
+      breakEndsAt = wall + quarterBreakMs;
     } else {
       if (!endPeriodSeen.has(game.id)) endPeriodSeen.set(game.id, Date.now());
-      breakEndsAt = endPeriodSeen.get(game.id) + QUARTER_BREAK_MS;
+      breakEndsAt = endPeriodSeen.get(game.id) + quarterBreakMs;
     }
   } else {
     endPeriodSeen.delete(game.id);
@@ -1859,8 +2157,8 @@ function breakRemaining(endsAt) {
 function breakStatusText(endsAt, period, short = false) {
   const remaining = breakRemaining(endsAt);
   const label = period ? `${periodLabel(period)}结束` : '节间休息';
-  if (short) return remaining > 0 ? `${label} ${formatCountdown(remaining)}` : label;
-  return remaining > 0 ? `${label} · ${formatCountdown(remaining)} 后继续` : `${label} · 节间休息`;
+  if (short) return remaining > 0 ? `${label} ${formatCountdown(remaining)}` : `${label} 即将开始`;
+  return remaining > 0 ? `${label} · ${formatCountdown(remaining)} 后继续` : `${label} · 即将开始`;
 }
 
 function liveStatusText(game, meta) {
@@ -1882,12 +2180,12 @@ function formatCountdown(totalSeconds) {
 
 function halftimeStatusText(endsAt) {
   const remaining = halftimeRemaining(endsAt);
-  return remaining > 0 ? `中场 · ${formatCountdown(remaining)} 后继续` : '中场休息';
+  return remaining > 0 ? `中场 · ${formatCountdown(remaining)} 后继续` : '中场 · 即将开始';
 }
 
 function shortHalftimeText(endsAt) {
   const remaining = halftimeRemaining(endsAt);
-  return remaining > 0 ? `中场 ${formatCountdown(remaining)}` : '中场休息';
+  return remaining > 0 ? `中场 ${formatCountdown(remaining)}` : '中场 即将开始';
 }
 
 function updateLiveClocks() {
@@ -1979,6 +2277,7 @@ function saveView() {
   } catch (error) {
     /* storage may be unavailable */
   }
+  scheduleCloudSync();
 }
 
 function renderDate() {
@@ -2003,7 +2302,7 @@ function renderSummary() {
   const rows = state.rows;
   const leaders = leadersForSorts(rows);
   const dayWord = state.dateParam ? '当日' : '今日';
-  // 每 20 秒刷新会重建这一段，保留横向滚动位置，避免看后面的字段时被弹回最左
+  // 每 10 秒刷新会重建这一段，保留横向滚动位置，避免看后面的字段时被弹回最左
   const prevScroll = el.summaryBar.querySelector('.sl-track')?.scrollLeft || 0;
 
   el.summaryBar.innerHTML = leaders.length

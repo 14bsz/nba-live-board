@@ -2759,3 +2759,36 @@ body.hscroll-dragging * {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------- 登录 / 注册 ---------- */
+
+.auth-btn.logged-in {
+  color: var(--accent-soft);
+  border-color: rgba(255, 177, 92, 0.35);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-card .auth-field {
+  margin-bottom: 10px;
+}
+
+.auth-error {
+  margin: 0 2px 10px;
+  font-size: 12px;
+  color: #ff6b6b;
+}
+
+.auth-submit {
+  width: 100%;
+  margin-top: 2px;
+}
+
+.auth-submit:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+  box-shadow: none;
+}

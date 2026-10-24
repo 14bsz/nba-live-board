@@ -8,6 +8,9 @@ node_modules/
 dist/
 build/
 
+# 运行时数据（账号、会话、关注名单，由 server.js 自动生成）
+data/
+
 # 系统与编辑器
 .DS_Store
 Thumbs.db
