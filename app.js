@@ -16,6 +16,11 @@ const CLOUD_SYNC_DEBOUNCE_MS = 800;
 const HOT_ALERT_KEY = 'nba-stand-hot-alerts-v1';
 const VIEW_KEY = 'nba-stand-view-v1';
 const REFRESH_SECONDS = 10;
+// 技术统计拉取：移动端同一域名连接数有限，一次性并发十几场会排队超时
+const SUMMARY_POOL_SIZE = 3;
+const SUMMARY_MAX_ATTEMPTS = 3;
+// 比赛 id -> 连续失败次数，用于失败重试与「暂不可用」提示
+const summaryFailCounts = new Map();
 const HALFTIME_MS = 15.5 * 60 * 1000;
 const QUARTER_BREAK_MS = 170 * 1000;
 const BREAK_SAMPLE_MIN_MS = 90 * 1000;
@@ -800,6 +805,7 @@ function bindEvents() {
     if (!state.dateParam) return;
     state.dateParam = null;
     state.summaries = new Map();
+    summaryFailCounts.clear();
     state.hasData = false;
     state.loadError = null;
     render();
@@ -1547,6 +1553,58 @@ function slateIsSettled() {
   return state.games.every((game) => game.state === 'final');
 }
 
+/** 还有技术统计缺着、且没超过重试上限 → 仍需要继续刷新把它们补齐 */
+function statsIncomplete() {
+  for (const count of summaryFailCounts.values()) {
+    if (count > 0 && count < SUMMARY_MAX_ATTEMPTS) return true;
+  }
+  return false;
+}
+
+/** 技术统计占位文案：失败到上限后不再显示「同步中」，避免看起来像卡死 */
+function summaryPendingText(gameId) {
+  return (summaryFailCounts.get(gameId) || 0) >= SUMMARY_MAX_ATTEMPTS
+    ? '球队技术统计暂不可用 · 点右上角刷新重试'
+    : '球队技术统计同步中…';
+}
+
+function playerPendingText(gameId) {
+  return (summaryFailCounts.get(gameId) || 0) >= SUMMARY_MAX_ATTEMPTS
+    ? '统计暂不可用 · 点右上角刷新'
+    : '技术统计同步中';
+}
+
+/**
+ * 并发池拉取技术统计。
+ * 之前是一次性把十几场全发出去：手机端每域名连接数有限（约 6 个），
+ * 排队尾巴很容易超过请求超时被中断，导致个别比赛永远停在「同步中」。
+ */
+async function fetchSummariesPooled(eventIds, attempts = 2) {
+  const results = new Array(eventIds.length).fill(null);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(SUMMARY_POOL_SIZE, eventIds.length) }, async () => {
+    while (cursor < eventIds.length) {
+      const index = cursor;
+      cursor += 1;
+      const id = eventIds[index];
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+          results[index] = await fetchJSON(API.summary(id));
+          break;
+        } catch (error) {
+          if (attempt === attempts) {
+            results[index] = null;
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+          }
+        }
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function refresh() {
   if (state.refreshing) {
     state.pendingRefresh = true;
@@ -1578,9 +1636,17 @@ async function refresh() {
       }
     }
 
-    const results = await Promise.allSettled(eventIds.map((id) => fetchJSON(API.summary(id))));
-    results.forEach((result, index) => {
-      if (result.status === 'fulfilled') summaries.set(eventIds[index], result.value);
+    const fetched = await fetchSummariesPooled(eventIds);
+    eventIds.forEach((id, index) => {
+      if (fetched[index]) {
+        summaries.set(id, fetched[index]);
+        summaryFailCounts.delete(id);
+      } else if (state.summaries.has(id)) {
+        // 本次失败但之前拿到过，沿用旧数据，不算缺失
+        summaries.set(id, state.summaries.get(id));
+      } else {
+        summaryFailCounts.set(id, (summaryFailCounts.get(id) || 0) + 1);
+      }
     });
 
     state.summaries = summaries;
@@ -1592,8 +1658,8 @@ async function refresh() {
     state.hasData = true;
     state.loadError = null;
     state.rows = buildRows();
-    // 当日无比赛或全部结束时停止自动刷新，不再空转打接口
-    secondsLeft = slateIsSettled() ? 0 : REFRESH_SECONDS;
+    // 当日无比赛或全部结束、且技术统计都拿齐了，才停止自动刷新
+    secondsLeft = slateIsSettled() && !statsIncomplete() ? 0 : REFRESH_SECONDS;
     announceHot = true;
     hideError();
   } catch (error) {
@@ -1695,7 +1761,8 @@ function buildRows() {
     const summary = state.summaries.get(game.id);
     if (!summary) {
       row.state = 'unknown';
-      row.statusLabel = '同步中';
+      row.statusLabel =
+        (summaryFailCounts.get(game.id) || 0) >= SUMMARY_MAX_ATTEMPTS ? '暂不可用' : '同步中';
       return row;
     }
 
@@ -2547,7 +2614,7 @@ function teamGameHTML(game, rows, watched) {
       ? ''
       : awayStats && homeStats
         ? teamCompareHTML(away, home, awayStats, homeStats, awayColor, homeColor)
-        : '<div class="game-stats-pending">球队技术统计同步中…</div>';
+        : `<div class="game-stats-pending">${esc(summaryPendingText(game.id))}</div>`;
 
   return `<article class="game-card ${game.state}${hasWatch ? ' has-watch' : ''}" style="--away-color:${esc(
     awayColor
@@ -3137,7 +3204,9 @@ function cardHTML({ row, rank, isTop, leaderBadge }) {
           ? player.teamId
             ? `球队${state.dateParam ? '当日' : '今日'}没有比赛`
             : '暂无球队信息'
-          : '技术统计同步中';
+          : row.game
+            ? playerPendingText(row.game.id)
+            : '技术统计同步中';
 
   return `<article id="card-${esc(player.id)}" class="card ${row.played ? 'is-played' : 'is-bench'}${
     isTop ? ' is-top' : ''
@@ -3436,6 +3505,7 @@ function shiftDate(delta) {
   state.dateParam = offsetDate(state.slateDate, delta);
   state.slateDate = paramToDate(state.dateParam);
   state.summaries = new Map();
+  summaryFailCounts.clear();
   state.hasData = false;
   state.loadError = null;
   render();
@@ -3482,8 +3552,8 @@ function startTicker() {
     }
     secondsLeft -= 1;
     if (secondsLeft <= 0) {
-      if (slateIsSettled()) {
-        secondsLeft = 0; // 无比赛 / 已全部结束：停掉自动刷新，等手动刷新或切日期
+      if (slateIsSettled() && !statsIncomplete()) {
+        secondsLeft = 0; // 无比赛 / 已全部结束且数据齐全：停掉自动刷新，等手动刷新或切日期
       } else {
         secondsLeft = REFRESH_SECONDS;
         refresh();
