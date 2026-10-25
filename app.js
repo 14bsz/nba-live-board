@@ -21,6 +21,13 @@ const SUMMARY_POOL_SIZE = 3;
 const SUMMARY_MAX_ATTEMPTS = 3;
 // 比赛 id -> 连续失败次数，用于失败重试与「暂不可用」提示
 const summaryFailCounts = new Map();
+// 用户主动点刷新时置位，让下一次请求带 X-Force-Refresh 穿透服务端缓存
+let bypassCacheOnce = false;
+// 首屏快照：存渲染结果而非原始 summary（12 场约 6MB，超出 localStorage 配额）
+const SNAPSHOT_KEY = 'nba-stand-snapshot-v2';
+const SNAPSHOT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+// 已载入内存的快照；渲染时若还没拿到实时数据就用它兜底
+let snapshotPayload = null;
 const HALFTIME_MS = 15.5 * 60 * 1000;
 const QUARTER_BREAK_MS = 170 * 1000;
 const BREAK_SAMPLE_MIN_MS = 90 * 1000;
@@ -724,6 +731,9 @@ async function init() {
   buildSortSelect();
   bindEvents();
   startTicker();
+  // 先把上次的快照读进内存，render() 会在没实时数据时用它把首屏填满，
+  // 再由下面的 refresh() 更新到最新
+  loadSnapshot();
   render();
 
   await refresh();
@@ -1530,12 +1540,16 @@ function savePlayers() {
   scheduleCloudSync();
 }
 
-async function fetchJSON(url) {
+async function fetchJSON(url, options = {}) {
   const controller = new AbortController();
   // 25 秒：跨境部署 + 首次无缓存时，单场技术统计的往返可能接近 10 秒
   const timer = setTimeout(() => controller.abort(), 25000);
   try {
-    const response = await fetch(url, { signal: controller.signal, cache: 'no-store' });
+    const response = await fetch(url, {
+      signal: controller.signal,
+      cache: 'no-store',
+      headers: options.headers,
+    });
     if (!response.ok) throw new Error('HTTP ' + response.status);
     return await response.json();
   } catch (error) {
@@ -1544,6 +1558,53 @@ async function fetchJSON(url) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * 首屏快照：把当前渲染结果存进 localStorage。
+ * 存 HTML 而不是原始 summary，是因为 12 场 summary 约 6MB，会直接撑爆配额；
+ * 页面用的是事件委托，innerHTML 还原不会丢交互。
+ */
+function saveSnapshot() {
+  if (!state.hasData || !el.grid) return;
+  try {
+    localStorage.setItem(
+      SNAPSHOT_KEY,
+      JSON.stringify({
+        at: Date.now(),
+        dateParam: state.dateParam,
+        grid: el.grid.innerHTML,
+        teamGrid: el.teamGrid ? el.teamGrid.innerHTML : '',
+        teamSummary: el.teamSummary ? el.teamSummary.innerHTML : '',
+        summaryBar: el.summaryBar ? el.summaryBar.innerHTML : '',
+        updatedText: el.updatedAt ? el.updatedAt.textContent : '',
+      })
+    );
+  } catch (error) {
+    /* 配额不足或隐私模式：跳过缓存，不影响正常使用 */
+  }
+}
+
+/** 读出本地快照到内存；日期或时效不符时不使用 */
+function loadSnapshot() {
+  try {
+    const raw = localStorage.getItem(SNAPSHOT_KEY);
+    if (!raw) return false;
+    const snap = JSON.parse(raw);
+    if (!snap || !snap.grid) return false;
+    snapshotPayload = snap;
+    return Boolean(activeSnapshot());
+  } catch (error) {
+    return false;
+  }
+}
+
+/** 当前日期可用、且没过期的快照；切换日期后旧快照不能拿来充数 */
+function activeSnapshot() {
+  if (!snapshotPayload) return null;
+  if (snapshotPayload.dateParam !== state.dateParam) return null;
+  if (Date.now() - snapshotPayload.at > SNAPSHOT_MAX_AGE_MS) return null;
+  return snapshotPayload;
 }
 
 /** 当日没有比赛，或所有比赛都已结束 → 没必要继续自动刷新 */
@@ -1579,8 +1640,9 @@ function playerPendingText(gameId) {
  * 之前是一次性把十几场全发出去：手机端每域名连接数有限（约 6 个），
  * 排队尾巴很容易超过请求超时被中断，导致个别比赛永远停在「同步中」。
  */
-async function fetchSummariesPooled(eventIds, attempts = 2) {
+async function fetchSummariesPooled(eventIds, attempts = 2, force = false) {
   const results = new Array(eventIds.length).fill(null);
+  const headers = force ? { 'X-Force-Refresh': '1' } : undefined;
   let cursor = 0;
   const workers = Array.from({ length: Math.min(SUMMARY_POOL_SIZE, eventIds.length) }, async () => {
     while (cursor < eventIds.length) {
@@ -1589,7 +1651,7 @@ async function fetchSummariesPooled(eventIds, attempts = 2) {
       const id = eventIds[index];
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
         try {
-          results[index] = await fetchJSON(API.summary(id));
+          results[index] = await fetchJSON(API.summary(id), { headers });
           break;
         } catch (error) {
           if (attempt === attempts) {
@@ -1612,12 +1674,18 @@ async function refresh() {
   }
   state.refreshing = true;
   const requestedDate = state.dateParam;
+  // 用户点刷新时穿透服务端缓存；自动刷新沿用缓存，避免白拉
+  const force = bypassCacheOnce;
+  bypassCacheOnce = false;
   let announceHot = false;
   el.refreshBtn.classList.add('spinning');
   renderUpdated();
 
   try {
-    const scoreboard = await fetchJSON(API.scoreboard(requestedDate));
+    const scoreboard = await fetchJSON(
+      API.scoreboard(requestedDate),
+      force ? { headers: { 'X-Force-Refresh': '1' } } : {}
+    );
     if (requestedDate !== state.dateParam) return;
     state.slateDate = requestedDate
       ? paramToDate(requestedDate)
@@ -1636,7 +1704,7 @@ async function refresh() {
       }
     }
 
-    const fetched = await fetchSummariesPooled(eventIds);
+    const fetched = await fetchSummariesPooled(eventIds, 2, force);
     eventIds.forEach((id, index) => {
       if (fetched[index]) {
         summaries.set(id, fetched[index]);
@@ -1669,6 +1737,7 @@ async function refresh() {
     state.refreshing = false;
     el.refreshBtn.classList.remove('spinning');
     render();
+    if (!state.loadError) saveSnapshot();
     if (announceHot) maybeAnnounceHot();
     if (state.pendingRefresh) {
       state.pendingRefresh = false;
@@ -2362,6 +2431,11 @@ function renderDate() {
 
 function renderSummary() {
   if (!state.hasData) {
+    const snap = activeSnapshot();
+    if (snap && snap.summaryBar) {
+      el.summaryBar.innerHTML = snap.summaryBar;
+      return;
+    }
     el.summaryBar.innerHTML = '';
     return;
   }
@@ -2530,6 +2604,13 @@ function visibleGames() {
 }
 
 function renderTeamGrid() {
+  const snap = !state.hasData ? activeSnapshot() : null;
+  if (snap && snap.teamGrid) {
+    el.teamGrid.innerHTML = snap.teamGrid;
+    el.teamEmpty.hidden = true;
+    return;
+  }
+
   if (!state.hasData) {
     if (state.loadError) {
       el.teamGrid.innerHTML = '';
@@ -3052,9 +3133,16 @@ function renderFilters() {
 }
 
 function renderUpdated() {
+  const snap = !state.hasData ? activeSnapshot() : null;
   let text;
   if (!state.lastUpdated) {
-    text = state.loadError ? '更新失败' : '加载中…';
+    if (state.refreshing) {
+      text = snap ? '正在更新 · 显示缓存数据' : '加载中…';
+    } else if (state.loadError) {
+      text = snap ? '刷新失败 · 显示缓存数据' : '更新失败';
+    } else {
+      text = snap ? '显示缓存数据' : '加载中…';
+    }
   } else if (state.refreshing) {
     text = '刷新中…';
   } else {
@@ -3080,6 +3168,14 @@ function renderGrid() {
       <h3>还没有关注球员</h3>
       <p>加上你关注的球员，比赛日的数据会自动出现在这里。</p>
       <button class="primary-btn" data-open-add>+ 添加球员</button>`;
+    return;
+  }
+
+  // 本次还没拿到数据，但手上有同日期快照 → 先用快照，别闪成空白
+  const snap = !state.hasData ? activeSnapshot() : null;
+  if (snap) {
+    el.grid.innerHTML = snap.grid;
+    el.emptyState.hidden = true;
     return;
   }
 
@@ -3537,6 +3633,8 @@ function offsetDate(dateString, delta) {
 function manualRefresh() {
   secondsLeft = REFRESH_SECONDS;
   state.loadError = null;
+  // 用户主动刷新 → 穿透服务端缓存，避免「点了没反应」
+  bypassCacheOnce = true;
   if (!state.hasData) render();
   refresh();
 }

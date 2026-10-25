@@ -5,6 +5,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 
 const PORT = Number(process.env.PORT) || 5590;
 const ROOT = __dirname;
@@ -284,7 +285,7 @@ async function handleApi(request, response, pathname) {
 
 /* ---------- 静态文件服务 ---------- */
 
-function serveStatic(pathname, response) {
+function serveStatic(pathname, request, response) {
   const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const filePath = path.resolve(ROOT, relative);
 
@@ -300,9 +301,18 @@ function serveStatic(pathname, response) {
       response.end('Not found');
       return;
     }
+    // app.js 约 152KB、styles.css 约 46KB，每次打开都重下很浪费；
+    // 用强 ETag + no-cache（每次校验、未变返 304），既省流量又不会拿到旧版本。
+    const etag = '"' + crypto.createHash('sha1').update(content).digest('hex').slice(0, 20) + '"';
+    if (request.headers['if-none-match'] === etag) {
+      response.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' });
+      response.end();
+      return;
+    }
     response.writeHead(200, {
       'Content-Type': MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
-      'Cache-Control': 'no-store',
+      'Cache-Control': 'no-cache',
+      ETag: etag,
     });
     response.end(content);
   });
@@ -316,42 +326,223 @@ const ESPN_HOSTS = {
   web: 'site.web.api.espn.com',
 };
 
-// 代理层短缓存：同一场比赛/同一次搜索在 15 秒内复用，避免多端与自动刷新重复回溯
-const PROXY_CACHE_TTL_MS = 15000;
-const PROXY_CACHE_MAX = 400;
+/* ---------- 分层缓存：按「数据还会不会变」决定 TTL ---------- */
+
+// NBA 数据的可变性差异极大：终场技术统计不会再变，进行中的比分每几秒就变。
+// 统一给 15 秒会让历史比赛每次访问都重新跨境拉 490KB，因此按比赛状态分档。
+const CACHE_TTL_FINAL = 7 * 24 * 60 * 60 * 1000; // 已结束比赛的技术统计
+const CACHE_TTL_LIVE = 8 * 1000; // 进行中
+const CACHE_TTL_UPCOMING = 60 * 1000; // 未开始（只有赛程信息）
+const CACHE_TTL_HISTORY = 6 * 60 * 60 * 1000; // 历史日期比分板 / 该日已全部结束
+const CACHE_TTL_STATIC_DATA = 24 * 60 * 60 * 1000; // 球员搜索：名单几乎不变
+const CACHE_TTL_DEFAULT = 10 * 1000;
+
+const PROXY_CACHE_MAX = 600;
+const PROXY_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+const CACHE_DIR = path.join(DATA_DIR, 'proxy-cache');
+
+// key -> { at, ttl, body, encoding, contentType }；Map 顺序即 LRU 顺序（末尾最新）
 const proxyCache = new Map();
+let proxyCacheBytes = 0;
+
+function cacheFilePath(key) {
+  return path.join(CACHE_DIR, crypto.createHash('sha256').update(key).digest('hex') + '.json');
+}
 
 function proxyCacheGet(key) {
   const hit = proxyCache.get(key);
   if (!hit) return null;
-  if (Date.now() - hit.at > PROXY_CACHE_TTL_MS) {
-    proxyCache.delete(key);
+  if (Date.now() - hit.at > hit.ttl) {
+    proxyCacheDrop(key);
     return null;
   }
+  // 命中即移到末尾，维持 LRU 顺序
+  proxyCache.delete(key);
+  proxyCache.set(key, hit);
   return hit;
 }
 
-function proxyCacheSet(key, value) {
-  if (proxyCache.size >= PROXY_CACHE_MAX) {
-    const oldest = proxyCache.keys().next().value;
-    if (oldest !== undefined) proxyCache.delete(oldest);
-  }
-  proxyCache.set(key, value);
+function proxyCacheDrop(key) {
+  const hit = proxyCache.get(key);
+  if (!hit) return;
+  proxyCache.delete(key);
+  proxyCacheBytes -= hit.body.length;
+  fs.unlink(cacheFilePath(key), () => {});
 }
 
-function sendProxyPayload(response, status, contentType, encoding, body, cacheState) {
+function proxyCachePrune() {
+  while (
+    proxyCache.size > PROXY_CACHE_MAX ||
+    (proxyCacheBytes > PROXY_CACHE_MAX_BYTES && proxyCache.size > 1)
+  ) {
+    const oldest = proxyCache.keys().next().value;
+    if (oldest === undefined) break;
+    proxyCacheDrop(oldest);
+  }
+}
+
+function proxyCacheSet(key, entry) {
+  const existing = proxyCache.get(key);
+  if (existing) {
+    proxyCacheBytes -= existing.body.length;
+    proxyCache.delete(key);
+  }
+  proxyCache.set(key, entry);
+  proxyCacheBytes += entry.body.length;
+  proxyCachePrune();
+
+  // 落盘：进程重启或沙箱重建后历史比赛仍能直接命中，不必回源
+  const payload = JSON.stringify({
+    key,
+    at: entry.at,
+    ttl: entry.ttl,
+    contentType: entry.contentType,
+    encoding: entry.encoding,
+    body: entry.body.toString('base64'),
+  });
+  const file = cacheFilePath(key);
+  fs.mkdir(CACHE_DIR, { recursive: true }, () => {
+    fs.writeFile(file, payload, () => {});
+  });
+}
+
+/** 启动时把未过期的磁盘缓存读回内存 */
+function loadProxyCacheFromDisk() {
+  fs.mkdir(CACHE_DIR, { recursive: true }, () => {
+    fs.readdir(CACHE_DIR, (error, files) => {
+      if (error) return;
+      const now = Date.now();
+      let loaded = 0;
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue;
+        const filePath = path.join(CACHE_DIR, file);
+        try {
+          const item = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+          if (!item.key || !item.body || !item.ttl) continue;
+          if (now - item.at > item.ttl) {
+            fs.unlink(filePath, () => {});
+            continue;
+          }
+          const body = Buffer.from(item.body, 'base64');
+          proxyCache.set(item.key, {
+            at: item.at,
+            ttl: item.ttl,
+            body,
+            encoding: item.encoding || '',
+            contentType: item.contentType,
+          });
+          proxyCacheBytes += body.length;
+          loaded += 1;
+        } catch {
+          /* 单条损坏不影响启动 */
+        }
+      }
+      proxyCachePrune();
+      if (loaded) console.log(`[cache] 从磁盘恢复 ${loaded} 条 ESPN 缓存`);
+    });
+  });
+}
+
+/** 解压后解析，用于判断比赛状态；失败返回 null（退化为默认 TTL） */
+function inspectJson(body, encoding) {
+  try {
+    let buffer = body;
+    if (/gzip/i.test(encoding)) buffer = zlib.gunzipSync(body);
+    else if (/deflate/i.test(encoding)) buffer = zlib.inflateSync(body);
+    if (buffer.length > 8 * 1024 * 1024) return null;
+    return JSON.parse(buffer.toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/** 美东日期 YYYYMMDD，用于判断 scoreboard 查的是不是历史日期 */
+function etDateString(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(now);
+  const pick = (type) => parts.find((part) => part.type === type)?.value || '';
+  return pick('year') + pick('month') + pick('day');
+}
+
+function scoreboardTTL(rest, json) {
+  const events = json?.events || [];
+  const matched = /[?&]dates=(\d{8})/.exec(rest);
+  const dates = matched ? matched[1] : null;
+  const today = etDateString();
+
+  // 只有「显式查某个历史日期」才是真正不会再变的资源
+  if (dates && dates < today) return CACHE_TTL_HISTORY;
+
+  // 未来日期：只有赛程，变化慢
+  if (dates && dates > today) return CACHE_TTL_UPCOMING;
+
+  // 默认视图 / 今天：ESPN 默认视图可能返回昨天的板，今晚会换成新赛程，
+  // 因此即使当前全部结束也只能短缓存，否则新比赛会被挡在缓存外。
+  if (!events.length) return CACHE_TTL_DEFAULT;
+
+  const settled = events.every(
+    (event) => event?.competitions?.[0]?.status?.type?.state === 'post'
+  );
+  return settled ? CACHE_TTL_UPCOMING : CACHE_TTL_DEFAULT;
+}
+
+function decideCacheTTL(rest, body, encoding) {
+  if (rest.startsWith('web/')) return CACHE_TTL_STATIC_DATA;
+
+  const json = inspectJson(body, encoding);
+  if (!json) return CACHE_TTL_DEFAULT;
+
+  if (rest.startsWith('site/apis/site/v2/sports/basketball/nba/summary')) {
+    const state = json?.header?.competitions?.[0]?.status?.type?.state;
+    if (state === 'post') return CACHE_TTL_FINAL;
+    if (state === 'in') return CACHE_TTL_LIVE;
+    if (state === 'pre') return CACHE_TTL_UPCOMING;
+    return CACHE_TTL_DEFAULT;
+  }
+
+  if (rest.startsWith('site/apis/site/v2/sports/basketball/nba/scoreboard')) {
+    return scoreboardTTL(rest, json);
+  }
+
+  return CACHE_TTL_DEFAULT;
+}
+
+function acceptsGzip(request) {
+  return /(^|,)\s*(gzip|deflate)\b/i.test(String(request?.headers?.['accept-encoding'] || ''));
+}
+
+function sendProxyPayload(response, status, contentType, encoding, body, cacheState, request, cachedAt, ttl) {
   if (response.headersSent) return;
+
+  // 上游统一用 gzip 存，客户端不支持时才解压后再发
+  let payload = body;
+  let outEncoding = encoding;
+  if (encoding && !acceptsGzip(request)) {
+    try {
+      payload = /gzip/i.test(encoding) ? zlib.gunzipSync(body) : zlib.inflateSync(body);
+      outEncoding = '';
+    } catch {
+      /* 解压失败就原样返回 */
+    }
+  }
+
   const headers = {
     'Content-Type': contentType || 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Proxy-Cache': cacheState,
   };
-  if (encoding) {
-    headers['Content-Encoding'] = encoding;
+  if (outEncoding) {
+    headers['Content-Encoding'] = outEncoding;
     headers.Vary = 'Accept-Encoding';
   }
+  if (ttl) headers['X-Cache-TTL'] = String(Math.round(ttl / 1000));
+  if (cachedAt) headers['X-Cache-Age'] = String(Math.round((Date.now() - cachedAt) / 1000));
   response.writeHead(status, headers);
-  response.end(body);
+  response.end(payload);
 }
 
 function handleEspnProxy(request, response, rest) {
@@ -367,15 +558,28 @@ function handleEspnProxy(request, response, rest) {
     return;
   }
 
-  // 关键：向 ESPN 请求压缩体。summary 单场未压缩约 490KB，gzip 后仅约 46KB，
-  // 在出口带宽受限的部署环境里能把 10 秒级耗时压到 1~2 秒，避免前端 15 秒超时。
-  const clientAcceptsGzip = /(^|,)\s*gzip\b/i.test(String(request.headers['accept-encoding'] || ''));
-  const cacheKey = (clientAcceptsGzip ? 'gzip:' : 'raw:') + rest;
+  // 关键：始终向 ESPN 申请压缩体。summary 单场未压缩约 490KB，gzip 后仅约 46KB，
+  // 在出口带宽受限的部署环境里能把 10 秒级耗时压到 1~2 秒。
+  // 缓存只存压缩体，避免 gzip / 未压缩两份重复条目。
+  const bypass = String(request.headers['x-force-refresh'] || '') === '1';
+  const cacheKey = rest;
 
-  const cached = proxyCacheGet(cacheKey);
-  if (cached) {
-    sendProxyPayload(response, 200, cached.contentType, cached.encoding, cached.body, 'hit');
-    return;
+  if (!bypass) {
+    const cached = proxyCacheGet(cacheKey);
+    if (cached) {
+      sendProxyPayload(
+        response,
+        200,
+        cached.contentType,
+        cached.encoding,
+        cached.body,
+        'hit',
+        request,
+        cached.at,
+        cached.ttl
+      );
+      return;
+    }
   }
 
   const proxyRequest = https.request(
@@ -386,7 +590,7 @@ function handleEspnProxy(request, response, rest) {
       headers: {
         'User-Agent': 'Mozilla/5.0',
         Accept: 'application/json',
-        ...(clientAcceptsGzip ? { 'Accept-Encoding': 'gzip, deflate' } : {}),
+        'Accept-Encoding': 'gzip, deflate',
       },
       timeout: 25000,
     },
@@ -398,10 +602,21 @@ function handleEspnProxy(request, response, rest) {
         const status = proxyResponse.statusCode || 502;
         const encoding = String(proxyResponse.headers['content-encoding'] || '');
         const contentType = proxyResponse.headers['content-type'];
-        if (status === 200) {
-          proxyCacheSet(cacheKey, { at: Date.now(), body, encoding, contentType });
+        const ttl = status === 200 ? decideCacheTTL(rest, body, encoding) : 0;
+        if (ttl > 0) {
+          proxyCacheSet(cacheKey, { at: Date.now(), ttl, body, encoding, contentType });
         }
-        sendProxyPayload(response, status, contentType, encoding, body, 'miss');
+        sendProxyPayload(
+          response,
+          status,
+          contentType,
+          encoding,
+          body,
+          bypass ? 'bypass' : 'miss',
+          request,
+          null,
+          ttl
+        );
       });
       proxyResponse.on('error', () => {
         if (!response.headersSent) {
@@ -428,6 +643,7 @@ function handleEspnProxy(request, response, rest) {
 }
 
 ensureStore();
+loadProxyCacheFromDisk();
 
 http
   .createServer(async (request, response) => {
@@ -454,7 +670,7 @@ http
         await handleApi(request, response, pathname);
         return;
       }
-      serveStatic(pathname, response);
+      serveStatic(pathname, request, response);
     } catch (error) {
       const status = error.statusCode || 500;
       if (!response.headersSent) {
