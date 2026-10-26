@@ -2338,6 +2338,22 @@ body.hscroll-dragging * {
   max-height: min(760px, 90vh);
 }
 
+/* 打开弹窗时会自动把焦点放到关闭按钮上，
+   这里让它的焦点态保持和平时一样，不要一进来就亮一圈橙色描边 */
+.player-modal-card .icon-btn:focus,
+.player-modal-card .icon-btn:focus-visible {
+  outline: none;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
+.player-modal-card .icon-btn:hover {
+  border-color: transparent;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+
 .player-modal-body {
   flex: 1;
   min-height: 60px;
@@ -2368,9 +2384,9 @@ body.hscroll-dragging * {
 
 .plog-row {
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) 92px 78px 44px 38px 64px;
+  grid-template-columns: 40px minmax(0, 1fr) 88px 74px 40px 34px 38px 58px;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   padding: 6px 8px;
   font-size: 11.5px;
   color: var(--muted);
@@ -2379,10 +2395,18 @@ body.hscroll-dragging * {
 }
 
 .plog-row.plog-head {
-  padding: 0 8px 2px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 2px 8px 4px;
   font-size: 10px;
   color: var(--dim);
-  background: transparent;
+  background: #10161f;
+}
+
+/* 长列表里靠悬停定位行，不额外加装饰 */
+.plog-row:not(.plog-head):not(.is-hot):hover {
+  background: rgba(255, 255, 255, 0.045);
 }
 
 /* 打得好那场：左侧橙色竖条 + 淡橙底 */
@@ -2446,7 +2470,8 @@ body.hscroll-dragging * {
 }
 
 .plog-def,
-.plog-min {
+.plog-min,
+.plog-ts {
   color: var(--dim);
   font-variant-numeric: tabular-nums;
 }
@@ -2485,7 +2510,7 @@ body.hscroll-dragging * {
 
 @media (max-width: 560px) {
   .plog-row {
-    grid-template-columns: 40px minmax(0, 1fr) 84px 72px 40px 32px 58px;
+    grid-template-columns: 36px minmax(0, 1fr) 76px 64px 36px 30px 34px 54px;
     gap: 4px;
     padding: 6px;
     font-size: 11px;

@@ -3084,13 +3084,14 @@ function openPlayerModal(playerId) {
   const player = state.players.find((p) => String(p.id) === String(playerId));
   if (!player) return;
   const stats = hotStatsFor(playerId);
+  const name = displayName(player);
   const teamName = cnTeam(player.teamAbbr) || player.teamAbbr || '';
   const metaParts = [];
+  if (name !== player.name) metaParts.push(player.name);
   if (teamName) metaParts.push(teamName);
   if (stats) metaParts.push(`赛季 ${stats.hotGames}/${stats.games} 场达标`);
-  metaParts.push(`阈值 ${state.hotThreshold} 场`);
 
-  el.playerModalTitle.textContent = player.name;
+  el.playerModalTitle.textContent = name;
   el.playerModalMeta.textContent = metaParts.join(' · ');
   el.playerModalBody.innerHTML = playerLogHTML(stats);
   playerModalTrigger = document.activeElement;
@@ -3120,7 +3121,7 @@ function playerLogHTML(stats) {
   }
 
   const head = `<div class="plog-row plog-head">
-    <span>日期</span><span>对手</span><span>比分</span><span>分/板/助</span><span>断+帽</span><span>分钟</span><span>判定</span>
+    <span>日期</span><span>对手</span><span>比分</span><span>分/板/助</span><span>断+帽</span><span>分钟</span><span>TS%</span><span>判定</span>
   </div>`;
 
   const body = stats.log
@@ -3152,13 +3153,28 @@ function playerLogHTML(stats) {
         <span class="plog-score">${esc(score)}${res}</span>
         <span class="plog-line">${line}</span>
         <span class="plog-def">${def}</span>
-        <span class="plog-min" title="真实命中率 ${esc(tsText)}%">${game.min}</span>
+        <span class="plog-min">${game.min}</span>
+        <span class="plog-ts">${esc(tsText)}</span>
         <span>${verdict}</span>
       </div>`;
     })
     .join('');
 
-  return `<p class="plog-summary">共 <b>${stats.games}</b> 场，其中 <b class="hl">${stats.hotGames}</b> 场达到打得好门槛</p>
+  // 顶部汇总一行，把赛季口径的场均一起带上，省得再点别处
+  const games = stats.log.length;
+  const total = (key) => stats.log.reduce((sum, game) => sum + (Number(game[key]) || 0), 0);
+  const avg = (key) => (games ? total(key) / games : 0);
+  const tsList = stats.log.filter((game) => game.ts != null);
+  const tsAvg = tsList.length
+    ? tsList.reduce((sum, game) => sum + Number(game.ts), 0) / tsList.length
+    : null;
+  const rate = games ? Math.round((stats.hotGames / games) * 100) : 0;
+
+  return `<p class="plog-summary">共 <b>${games}</b> 场 · 打得好 <b class="hl">${stats.hotGames}</b> 场（${rate}%）· 场均 <b>${avg(
+    'pts'
+  ).toFixed(1)}</b> 分 / <b>${avg('reb').toFixed(1)}</b> 板 / <b>${avg('ast').toFixed(1)}</b> 助 · TS <b>${
+    tsAvg == null ? '—' : tsAvg.toFixed(1) + '%'
+  }</b></p>
     <div class="plog-list">${head}${body}</div>`;
 }
 
