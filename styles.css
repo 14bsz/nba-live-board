@@ -497,6 +497,23 @@ img {
   letter-spacing: 0.3px;
 }
 
+/* 赛季统计还没拉完时的占位，避免这一行整块消失让人以为功能没了 */
+.hot-stats.pending .hs-count {
+  color: var(--dim);
+  font-style: normal;
+  animation: hotStatsPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes hotStatsPulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .hot-stats .hs-count {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
@@ -1605,12 +1622,17 @@ body.hscroll-dragging * {
   position: relative;
   padding: 16px;
   overflow: hidden;
+  cursor: pointer;
   background:
     linear-gradient(165deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0) 46%),
     var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   transition: transform 0.18s ease, border-color 0.18s ease;
+}
+
+.card .remove {
+  cursor: pointer;
 }
 
 .card::before {
@@ -2054,8 +2076,8 @@ body.hscroll-dragging * {
   color: var(--dim);
 }
 
+/* 排序键与打得好命中都只换颜色，所有数据保持同一字号 */
 .stat.main b {
-  font-size: 22px;
   color: var(--accent-soft);
 }
 
@@ -2065,6 +2087,11 @@ body.hscroll-dragging * {
 
 .is-bench .stat.main b {
   color: #5a687d;
+}
+
+/* 命中「打得好」门槛的数据项：只换文字颜色，字号与其他数据保持一致 */
+.stat.hit b {
+  color: var(--accent-soft);
 }
 
 .adv {
@@ -2101,12 +2128,12 @@ body.hscroll-dragging * {
   font-variant-numeric: tabular-nums;
 }
 
-.adv-cell.good b {
-  color: var(--live);
-}
-
 .adv-cell.bad b {
   color: #ff8a8a;
+}
+
+.adv-cell.hit b {
+  color: var(--accent-soft);
 }
 
 .adv-cell.focus {
@@ -2146,6 +2173,11 @@ body.hscroll-dragging * {
 }
 
 .foot-item.focus {
+  color: var(--accent-soft);
+  font-weight: 700;
+}
+
+.foot-item.hit {
   color: var(--accent-soft);
   font-weight: 700;
 }
@@ -2297,6 +2329,167 @@ body.hscroll-dragging * {
 .roster-modal-card {
   width: min(960px, 100%);
   max-height: min(760px, 90vh);
+}
+
+/* ---------- 球员逐场记录弹窗 ---------- */
+
+.player-modal-card {
+  width: min(640px, 100%);
+  max-height: min(760px, 90vh);
+}
+
+.player-modal-body {
+  flex: 1;
+  min-height: 60px;
+  overflow-y: auto;
+  padding: 2px 2px 4px;
+}
+
+.plog-summary {
+  margin: 0 0 10px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.plog-summary b {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.plog-summary b.hl {
+  color: var(--accent-soft);
+}
+
+.plog-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.plog-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 92px 78px 44px 38px 64px;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.022);
+}
+
+.plog-row.plog-head {
+  padding: 0 8px 2px;
+  font-size: 10px;
+  color: var(--dim);
+  background: transparent;
+}
+
+/* 打得好那场：左侧橙色竖条 + 淡橙底 */
+.plog-row.is-hot {
+  color: var(--text);
+  background: rgba(255, 122, 26, 0.1);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.plog-date {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.plog-row.is-hot .plog-date {
+  color: #ffd9ae;
+}
+
+.plog-opp {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.plog-score {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.plog-res {
+  padding: 0 4px;
+  font-size: 9.5px;
+  font-style: normal;
+  border-radius: 4px;
+}
+
+.plog-res.win {
+  color: #9fe1cb;
+  background: rgba(46, 224, 122, 0.14);
+}
+
+.plog-res.loss {
+  color: #f09595;
+  background: rgba(255, 138, 138, 0.14);
+}
+
+.plog-line {
+  letter-spacing: -0.2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.plog-line b {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.plog-row.is-hot .plog-line b {
+  color: var(--accent-soft);
+}
+
+.plog-def,
+.plog-min {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.plog-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 10px;
+  white-space: nowrap;
+  border-radius: 999px;
+}
+
+.plog-tag.hot {
+  color: #ffd9ae;
+  font-weight: 700;
+  background: rgba(255, 122, 26, 0.18);
+  border: 1px solid rgba(255, 122, 26, 0.42);
+}
+
+.plog-tag.dq {
+  color: #b4b2a9;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line);
+}
+
+.plog-tag.none {
+  color: var(--dim);
+}
+
+.plog-empty {
+  margin: 24px 0;
+  font-size: 12px;
+  text-align: center;
+  color: var(--muted);
+}
+
+@media (max-width: 560px) {
+  .plog-row {
+    grid-template-columns: 40px minmax(0, 1fr) 84px 72px 40px 32px 58px;
+    gap: 4px;
+    padding: 6px;
+    font-size: 11px;
+  }
 }
 
 .roster-modal-head {

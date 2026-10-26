@@ -5,7 +5,7 @@ const API = {
     '/api/espn/site/apis/site/v2/sports/basketball/nba/scoreboard' + (dates ? '?dates=' + dates : ''),
   summary: (eventId) => '/api/espn/site/apis/site/v2/sports/basketball/nba/summary?event=' + eventId,
   search: (query) =>
-    '/api/espn/web/apis/common/v3/search?query=' +
+    '/api/espn/site/apis/common/v3/search?query=' +
     encodeURIComponent(query) +
     '&type=player&sport=basketball&league=nba',
 };
@@ -35,9 +35,11 @@ const BREAK_SAMPLE_MAX_MS = 8 * 60 * 1000;
 const TIMEOUT_VISIBLE_MS = 2 * 60 * 1000;
 const HOT_MIN_MINUTES = 10;
 const HOT_MIN_RULES = 2;
+// 判定规则版本：门槛口径一改就递增，让赛季统计的旧缓存自动作废
+const HOT_RULES_VERSION = 5; // 5：缓存增加逐场明细（log）；4：得分门槛 20→15 + 效率否决
 
 const HOT_RULES = [
-  { key: 'pts', label: '20+分', test: (stats) => stats.pts >= 20 },
+  { key: 'pts', label: '15+分', test: (stats) => stats.pts >= 15 },
   { key: 'reb', label: '8+板', test: (stats) => stats.reb >= 8 },
   { key: 'ast', label: '6+助', test: (stats) => stats.ast >= 6 },
   { key: 'stocks', label: '3+断帽', test: (stats) => stats.stl + stats.blk >= 3 },
@@ -53,9 +55,23 @@ const HOT_RULES = [
   },
 ];
 
+// 一票否决：出手不少却几乎没产出，这种场次防守数据再好看也不该算「打得好」。
+// 典型反例：22 分钟 7 投 0 中得 0 分、抢 8 个板，按纯达标项会被算成好球。
+const HOT_DQ_MIN_ATTEMPTS = 5; // 出手次数达到该值才进入否决判断
+const HOT_DQ_MIN_TS = 40; // 真实命中率低于该值视为进攻熄火
+const HOT_DQ_MIN_POINTS = 5; // 得分低于该值同样视为熄火
+
 const HOT_CRITERIA_TEXT =
-  `上场至少 ${HOT_MIN_MINUTES} 分钟，且满足任意 ${HOT_MIN_RULES} 项：20+分、8+篮板、6+助攻、` +
-  '3+抢断盖帽、真实命中率≥60%（至少8次出手）、正负值≥+10、两双/三双。';
+  `上场至少 ${HOT_MIN_MINUTES} 分钟，满足任意 ${HOT_MIN_RULES} 项即算打得好：15+分、8+篮板、6+助攻、` +
+  '3+抢断盖帽、真实命中率≥60%（至少8次出手）、正负值≥+10、两双/三双。' +
+  `\n否决条件：出手 ≥${HOT_DQ_MIN_ATTEMPTS} 次且真实命中率 <${HOT_DQ_MIN_TS}%，或出手 ≥${HOT_DQ_MIN_ATTEMPTS} 次且得分 <${HOT_DQ_MIN_POINTS}，一律不算。`;
+
+// 赛季逐场统计的口径说明：正负值要额外补查，见 parseGamelog
+const HOT_SEASON_NOTE =
+  '赛季场次按同一套门槛逐场统计（含效率否决条件），正负值取自逐场技术统计，仅对差一项达标的场次补查。';
+
+// 第一遍打分用的规则集：先不判正负值，等补查结果回来再定论
+const HOT_RULES_SEASON = HOT_RULES.filter((rule) => rule.key !== 'pm');
 
 const CN_TEAMS = {
   ATL: '老鹰', BKN: '篮网', BOS: '凯尔特人', CHA: '黄蜂', CHI: '公牛', CLE: '骑士',
@@ -249,8 +265,12 @@ const BAG_PLAYERS = [
 const HOT_STATS_KEY = 'nba-stand-hot-stats-v1';
 const HOT_THRESHOLD_KEY = 'nba-stand-hot-threshold-v1';
 const DEFAULT_HOT_THRESHOLD = 5;
+// 赛季火热场次缓存有效期。不能按「美东日期」判活：
+// 美东同一天里可能先有比赛结束，日期没变但数据已经变了。
+const HOT_STATS_TTL_MS = 60 * 60 * 1000;
 const GAMELOG_API = (id, season) =>
-  `/api/espn/web/apis/common/v3/sports/basketball/nba/athletes/${id}/gamelog` +
+  // 用 site 域名而不是 site.web：线上沙箱访问 site.web.api.espn.com 会 25 秒超时
+  `/api/espn/site/apis/common/v3/sports/basketball/nba/athletes/${id}/gamelog` +
   (season ? `?season=${season}` : '');
 
 const NAME_ZH = {
@@ -713,6 +733,11 @@ async function init() {
   el.rosterModalTitle = document.getElementById('rosterModalTitle');
   el.rosterModalMeta = document.getElementById('rosterModalMeta');
   el.rosterModalBody = document.getElementById('rosterModalBody');
+  el.playerModal = document.getElementById('playerModal');
+  el.playerModalClose = document.getElementById('playerModalClose');
+  el.playerModalTitle = document.getElementById('playerModalTitle');
+  el.playerModalMeta = document.getElementById('playerModalMeta');
+  el.playerModalBody = document.getElementById('playerModalBody');
   el.toast = document.getElementById('toast');
   el.refreshHint = document.getElementById('refreshHint');
   el.authBtn = document.getElementById('authBtn');
@@ -794,6 +819,7 @@ function bindEvents() {
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if (!el.authModal.hidden) closeAuthModal();
+    else if (!el.playerModal.hidden) closePlayerModal();
     else if (!el.rosterModal.hidden) closeRosterModal();
     else if (!el.modal.hidden) closeModal();
   });
@@ -864,7 +890,18 @@ function bindEvents() {
 
   el.grid.addEventListener('click', (event) => {
     const button = event.target.closest('[data-remove]');
-    if (button) removePlayer(button.dataset.remove);
+    if (button) {
+      removePlayer(button.dataset.remove);
+      return;
+    }
+    // 点卡片任意非按钮区域 → 打开该球员的本赛季逐场记录
+    const card = event.target.closest('[data-player-id]');
+    if (card) openPlayerModal(card.dataset.playerId);
+  });
+
+  el.playerModalClose.addEventListener('click', closePlayerModal);
+  el.playerModal.addEventListener('click', (event) => {
+    if (event.target === el.playerModal) closePlayerModal();
   });
 
   el.hotBar.addEventListener('click', (event) => {
@@ -1402,13 +1439,13 @@ function gameLogStats(row, index) {
   return stats;
 }
 
-function parseGamelog(data) {
+async function parseGamelog(data, playerId) {
   const labels = data?.labels || [];
   const index = {};
   labels.forEach((label, position) => {
     index[label] = position;
   });
-  const result = { games: 0, hotGames: 0, hotDates: [] };
+  const result = { games: 0, hotGames: 0, hotDates: [], log: [] };
   if (index['PTS'] === undefined) return result;
 
   const events = data.events || {};
@@ -1416,24 +1453,97 @@ function parseGamelog(data) {
   const regular = (data.seasonTypes || []).filter((type) => /regular/i.test(type.displayName || ''));
   const sources = regular.length ? regular : data.seasonTypes || [];
 
+  // 先按「不依赖正负值的维度」逐场打分，gamelog 里没有 +/-，需要补查
+  const rows = [];
   for (const seasonType of sources) {
     for (const category of seasonType.categories || []) {
-      for (const [eventId, entry] of Object.entries(category.events || {})) {
+      for (const [fallbackId, entry] of Object.entries(category.events || {})) {
         const row = entry?.stats;
         if (!Array.isArray(row)) continue;
         const stats = gameLogStats(row, index);
         if (stats.minutes == null || stats.minutes <= 0) continue; // 未出场不计
-        result.games += 1;
-        if (hotReasons(stats)) {
-          result.hotGames += 1;
-          const eventKey = entry?.eventId || eventId;
-          const date = events[eventKey]?.gameDate;
-          if (date) result.hotDates.push(String(date).slice(0, 10));
-        }
+        const eventId = String(entry?.eventId || fallbackId);
+        const date = events[eventId]?.gameDate;
+        // 被否决的场次直接记 0 项，也就不必再为它补查正负值
+        const dq = hotDisqualifier(stats);
+        rows.push({
+          eventId,
+          stats,
+          dq,
+          date: date ? String(date).slice(0, 10) : null,
+          disqualified: dq != null,
+          reasons: dq ? [] : collectHotReasons(stats, HOT_RULES_SEASON) || [],
+        });
       }
     }
   }
+  result.games = rows.length;
+
+  // 只有「差一项就达标」的场次，补上正负值才可能改变结论：
+  // 0 项补了也只有 1 项，≥2 项本来就已经算数，这两类都不用查。
+  const needPlusMinus = rows.filter((row) => row.reasons.length === HOT_MIN_RULES - 1);
+  const plusMinus = needPlusMinus.length
+    ? await fetchPlusMinus(needPlusMinus.map((row) => row.eventId))
+    : {};
+
+  for (const row of rows) {
+    const reasons = row.reasons.slice();
+    if (reasons.length === HOT_MIN_RULES - 1) {
+      const value = plusMinus[row.eventId]?.[String(playerId)];
+      if (typeof value === 'number' && value >= 10) {
+        reasons.push({ key: 'pm', label: '正负+10' });
+      }
+    }
+    const isHot = reasons.length >= HOT_MIN_RULES;
+    if (isHot) {
+      result.hotGames += 1;
+      if (row.date) result.hotDates.push(row.date);
+    }
+
+    // 逐场明细：供卡片详情弹窗展示，字段名压到最短以控制缓存体积
+    const meta = events[row.eventId] || {};
+    const s = row.stats;
+    result.log.push({
+      e: row.eventId,
+      d: row.date,
+      o: meta.opponent?.abbreviation || '',
+      v: meta.atVs || 'vs',
+      sc: meta.score || '',
+      r: meta.gameResult || '',
+      min: Math.round(s.minutes),
+      pts: s.pts,
+      reb: s.reb,
+      ast: s.ast,
+      stl: s.stl,
+      blk: s.blk,
+      ts: s.ts == null ? null : Math.round(s.ts * 10) / 10,
+      hot: isHot,
+      k: reasons.map((reason) => reason.key),
+      dq: row.dq || null,
+    });
+  }
+
+  // 最近的比赛排在最前
+  result.log.sort((a, b) => String(b.d || '').localeCompare(String(a.d || '')));
   result.hotDates.sort();
+  return result;
+}
+
+/** 批量补查若干场比赛的正负值；服务端按比赛缓存，多球员共享同一份结果 */
+async function fetchPlusMinus(eventIds) {
+  const ids = [...new Set(eventIds)];
+  if (!ids.length) return {};
+  // 服务端单次最多 40 场，这里分批，避免赛季中后期场次变多后被拒
+  const BATCH = 40;
+  const result = {};
+  for (let i = 0; i < ids.length; i += BATCH) {
+    try {
+      const data = await fetchJSON(`/api/plusminus?events=${ids.slice(i, i + BATCH).join(',')}`);
+      if (data && typeof data === 'object') Object.assign(result, data);
+    } catch (error) {
+      // 单批失败就跳过，退回「不含该维度」的口径，不影响其他批次
+    }
+  }
   return result;
 }
 
@@ -1442,7 +1552,12 @@ function readHotStatsCache() {
     const raw = localStorage.getItem(HOT_STATS_KEY);
     if (!raw) return null;
     const data = JSON.parse(raw);
-    if (data && data.date === currentEtDate() && data.players) return data;
+    if (!data || !data.players) return null;
+    // 判定规则改过就作废旧缓存，否则会一直显示旧口径算出来的场次
+    if (data.rulesVersion !== HOT_RULES_VERSION) return null;
+    const at = Number(data.at);
+    if (!Number.isFinite(at) || Date.now() - at > HOT_STATS_TTL_MS) return null;
+    return data;
   } catch (error) {
     /* ignore */
   }
@@ -1453,7 +1568,13 @@ function writeHotStatsCache(players) {
   try {
     localStorage.setItem(
       HOT_STATS_KEY,
-      JSON.stringify({ date: currentEtDate(), players, version: STORE_VERSION })
+      JSON.stringify({
+        date: currentEtDate(),
+        at: Date.now(),
+        rulesVersion: HOT_RULES_VERSION,
+        players,
+        version: STORE_VERSION,
+      })
     );
   } catch (error) {
     /* ignore */
@@ -1465,7 +1586,7 @@ async function fetchHotStats(playerId) {
   // 否则会把上一个完整赛季的场次算进来，虚高成一整个赛季。
   try {
     const data = await fetchJSON(GAMELOG_API(playerId, currentSeasonYear()));
-    return parseGamelog(data);
+    return await parseGamelog(data, playerId);
   } catch (error) {
     return { games: 0, hotGames: 0, hotDates: [] };
   }
@@ -1482,45 +1603,67 @@ async function loadHotStats(force = false) {
   if (state.hotStatsLoading) return;
   state.hotStatsLoading = true;
 
-  const cached = force ? null : readHotStatsCache();
-  const todo = cached ? state.players.filter((p) => !cached.players[p.id]) : state.players;
-  if (cached) state.hotStats = { ...cached.players };
+  try {
+    const cached = force ? null : readHotStatsCache();
+    const todo = cached ? state.players.filter((p) => !cached.players[p.id]) : state.players;
+    if (cached) state.hotStats = { ...cached.players };
+    // 先把当前状态画出来：有缓存直接显示真实场次，没有就先挂「统计中…」
+    renderGrid();
 
-  if (todo.length) {
-    showToast(`正在统计赛季火热场次（${todo.length} 人）…`);
-    // 并发池设为 4：浏览器同一域名最多 6 个连接，留 2 个给登录、搜索等交互请求
-    const pool = 4;
-    let done = 0;
-    let cursor = 0;
-    const workers = Array.from({ length: Math.min(pool, todo.length) }, async () => {
-      while (cursor < todo.length) {
-        const player = todo[cursor];
-        cursor += 1;
-        try {
-          state.hotStats[player.id] = await fetchHotStats(player.id);
-        } catch (error) {
-          state.hotStats[player.id] = { games: 0, hotGames: 0, hotDates: [] };
+    if (todo.length) {
+      showToast(`正在统计赛季火热场次（${todo.length} 人）…`);
+      // 并发池设为 4：浏览器同一域名最多 6 个连接，留 2 个给登录、搜索等交互请求
+      const pool = 4;
+      let done = 0;
+      let cursor = 0;
+      const workers = Array.from({ length: Math.min(pool, todo.length) }, async () => {
+        while (cursor < todo.length) {
+          const player = todo[cursor];
+          cursor += 1;
+          try {
+            state.hotStats[player.id] = await fetchHotStats(player.id);
+          } catch (error) {
+            state.hotStats[player.id] = { games: 0, hotGames: 0, hotDates: [] };
+          }
+          done += 1;
+          if (done % 10 === 0 || done === todo.length) {
+            showToast(`正在统计赛季火热场次 ${done}/${todo.length}`);
+          }
+          // 每算完一个人就刷新一次，用户能逐个看到结果，不必等全部拉完
+          try {
+            renderGrid();
+          } catch (error) {
+            /* 单次渲染失败不影响后续拉取 */
+          }
         }
-        done += 1;
-        if (done % 10 === 0 || done === todo.length) {
-          showToast(`正在统计赛季火热场次 ${done}/${todo.length}`);
-        }
-      }
-    });
-    await Promise.all(workers);
-    // 全部请求失败时不写缓存，避免把「0 场」的脏数据锁一整天
-    const anyData = Object.values(state.hotStats).some((item) => item && item.games > 0);
-    if (anyData) writeHotStatsCache(state.hotStats);
+      });
+      await Promise.all(workers);
+      // 全部请求失败时不写缓存，避免把「0 场」的脏数据锁一整天
+      const anyData = Object.values(state.hotStats).some((item) => item && item.games > 0);
+      if (anyData) writeHotStatsCache(state.hotStats);
+    }
+
+    state.hotStatsLoaded = true;
+    const stable = stableRows().length;
+    const flash = flashRows().length;
+    if (stable + flash) {
+      showToast(`赛季火热：稳定 ${stable} 人 · 昙花一现 ${flash} 人（阈值 ${state.hotThreshold} 场）`);
+    }
+  } catch (error) {
+    // 拉取中途出错也要让卡片从「统计中」回到正常状态
+    console.warn('赛季火热统计失败', error);
+  } finally {
+    state.hotStatsLoading = false;
+    // 无论成功失败都标记为「已尝试」，卡片才会从「统计中」切到最终状态
+    state.hotStatsLoaded = true;
+    try {
+      renderSummary();
+      renderFilters();
+      renderGrid();
+    } catch (error) {
+      console.warn('赛季火热渲染失败', error);
+    }
   }
-
-  state.hotStatsLoaded = true;
-  state.hotStatsLoading = false;
-  renderSummary();
-  renderFilters();
-  renderGrid();
-  const stable = stableRows().length;
-  const flash = flashRows().length;
-  if (stable + flash) showToast(`赛季火热：稳定 ${stable} 人 · 昙花一现 ${flash} 人（阈值 ${state.hotThreshold} 场）`);
 }
 
 function stableRows() {
@@ -1840,6 +1983,8 @@ function buildRows() {
       row.played = true;
       row.stats = stats;
       row.hot = hotReasons(stats);
+      // 达标项够了但被否决时记下原因，卡片悬停能看出为什么没打标
+      row.dq = row.hot ? null : hotDisqualifier(stats);
       row.state = game.state === 'live' ? 'live' : 'final';
       if (game.state === 'live') {
         row.onCourt = row.meta?.halftime || row.meta?.endPeriod ? false : stats.active;
@@ -2031,9 +2176,22 @@ function opponentTotals(summary, teamId) {
   return opponent ? teamTotals(summary, opponent.team?.id) : null;
 }
 
-function hotReasons(stats) {
+/** 一票否决：命中返回原因文本，未命中返回 null */
+function hotDisqualifier(stats) {
+  if (!stats || stats.fga == null || stats.fga < HOT_DQ_MIN_ATTEMPTS) return null;
+  if (stats.ts != null && stats.ts < HOT_DQ_MIN_TS) {
+    return `出手 ${stats.fga} 次，真实命中率仅 ${stats.ts.toFixed(1)}%`;
+  }
+  if (stats.pts < HOT_DQ_MIN_POINTS) {
+    return `出手 ${stats.fga} 次，仅得 ${stats.pts} 分`;
+  }
+  return null;
+}
+
+/** 列出这一场命中的全部维度（不做数量过滤），供「差几项」的判定复用 */
+function collectHotReasons(stats, rules = HOT_RULES) {
   if (!stats || stats.minutes < HOT_MIN_MINUTES) return null;
-  const reasons = HOT_RULES.filter((rule) => rule.test(stats)).map((rule) => ({
+  const reasons = rules.filter((rule) => rule.test(stats)).map((rule) => ({
     key: rule.key,
     label: rule.label,
   }));
@@ -2042,7 +2200,19 @@ function hotReasons(stats) {
   ).length;
   if (doubleDigits >= 3) reasons.push({ key: 'td', label: '三双' });
   else if (doubleDigits >= 2) reasons.push({ key: 'dd', label: '两双' });
-  return reasons.length >= HOT_MIN_RULES ? reasons : null;
+  return reasons;
+}
+
+function hotReasons(stats, options = {}) {
+  // 赛季逐场数据（gamelog）没有正负值字段，统计时先按不含该维度的规则打分，
+  // 差一项达标的场次再由 fetchPlusMinus 补查后定论（见 parseGamelog）。
+  const rules = options.skipPlusMinus ? HOT_RULES_SEASON : HOT_RULES;
+  const reasons = collectHotReasons(stats, rules);
+  if (!reasons) return null;
+  if (reasons.length < HOT_MIN_RULES) return null;
+  // 达标项够了也要过否决这一关：效率熄火的场次不能靠防守数据凑成好球
+  if (hotDisqualifier(stats)) return null;
+  return reasons;
 }
 
 function hotRows() {
@@ -2530,7 +2700,7 @@ function renderHotBar() {
     <div class="hotbar-head">
       <span class="hotbar-title">打得好</span>
       <span class="hotbar-count">${rows.length}</span>
-      <span class="hotbar-sub" title="${esc(HOT_CRITERIA_TEXT)}">上场≥${HOT_MIN_MINUTES}分钟 · 任意${HOT_MIN_RULES}项：20分/8板/6助/3断帽/TS60%/正负+10/两双</span>
+      <span class="hotbar-sub" title="${esc(HOT_CRITERIA_TEXT)}">上场≥${HOT_MIN_MINUTES}分钟 · 任意${HOT_MIN_RULES}项：15分/8板/6助/3断帽/TS60%/正负+10/两双</span>
     </div>
     ${
       rows.length
@@ -2895,8 +3065,104 @@ function closeRosterModal({ restoreFocus = true } = {}) {
   fallback?.focus({ preventScroll: true });
 }
 
-function rosterGameStatus(game) {
-  const meta = state.gameMeta.get(game.id) || {};
+/* ---------- 球员逐场记录弹窗 ---------- */
+
+const HOT_KEY_SHORT = {
+  pts: '得分',
+  reb: '篮板',
+  ast: '助攻',
+  stocks: '断帽',
+  ts: '效率',
+  pm: '正负',
+  dd: '两双',
+  td: '三双',
+};
+
+let playerModalTrigger = null;
+
+function openPlayerModal(playerId) {
+  const player = state.players.find((p) => String(p.id) === String(playerId));
+  if (!player) return;
+  const stats = hotStatsFor(playerId);
+  const teamName = cnTeam(player.teamAbbr) || player.teamAbbr || '';
+  const metaParts = [];
+  if (teamName) metaParts.push(teamName);
+  if (stats) metaParts.push(`赛季 ${stats.hotGames}/${stats.games} 场达标`);
+  metaParts.push(`阈值 ${state.hotThreshold} 场`);
+
+  el.playerModalTitle.textContent = player.name;
+  el.playerModalMeta.textContent = metaParts.join(' · ');
+  el.playerModalBody.innerHTML = playerLogHTML(stats);
+  playerModalTrigger = document.activeElement;
+  el.playerModal.hidden = false;
+  document.body.classList.add('modal-open');
+  el.playerModalClose.focus({ preventScroll: true });
+}
+
+function closePlayerModal() {
+  if (el.playerModal.hidden) return;
+  el.playerModal.hidden = true;
+  el.playerModalBody.innerHTML = '';
+  const trigger = playerModalTrigger;
+  playerModalTrigger = null;
+  if (el.modal.hidden && el.rosterModal.hidden && el.authModal.hidden) {
+    document.body.classList.remove('modal-open');
+  }
+  if (trigger?.isConnected) trigger.focus({ preventScroll: true });
+}
+
+function playerLogHTML(stats) {
+  if (!stats || !Array.isArray(stats.log) || !stats.log.length) {
+    const hint = state.hotStatsLoading
+      ? '正在拉取本赛季逐场数据，稍等一下…'
+      : '暂无逐场数据（本赛季还没出场，或数据拉取失败）';
+    return `<p class="plog-empty">${esc(hint)}</p>`;
+  }
+
+  const head = `<div class="plog-row plog-head">
+    <span>日期</span><span>对手</span><span>比分</span><span>分/板/助</span><span>断+帽</span><span>分钟</span><span>判定</span>
+  </div>`;
+
+  const body = stats.log
+    .map((game) => {
+      const date = game.d ? game.d.slice(5) : '—';
+      const opp = `${game.v === '@' ? '@' : 'vs'} ${game.o || '—'}`;
+      const score = game.sc || '—';
+      const res =
+        game.r === 'W'
+          ? '<i class="plog-res win">胜</i>'
+          : game.r === 'L'
+            ? '<i class="plog-res loss">负</i>'
+            : '';
+      const line = `<b>${game.pts}</b>/${game.reb}/${game.ast}`;
+      const def = `${game.stl}+${game.blk}`;
+      const tsText = game.ts == null ? '—' : game.ts.toFixed(1);
+      let verdict;
+      if (game.hot) {
+        const why = (game.k || []).map((key) => HOT_KEY_SHORT[key] || key).join('、');
+        verdict = `<span class="plog-tag hot" title="${esc('达标维度：' + why)}">打得好</span>`;
+      } else if (game.dq) {
+        verdict = `<span class="plog-tag dq" title="${esc('一票否决：' + game.dq)}">不计</span>`;
+      } else {
+        verdict = '<span class="plog-tag none">—</span>';
+      }
+      return `<div class="plog-row${game.hot ? ' is-hot' : ''}">
+        <span class="plog-date">${esc(date)}</span>
+        <span class="plog-opp">${esc(opp)}</span>
+        <span class="plog-score">${esc(score)}${res}</span>
+        <span class="plog-line">${line}</span>
+        <span class="plog-def">${def}</span>
+        <span class="plog-min" title="真实命中率 ${esc(tsText)}%">${game.min}</span>
+        <span>${verdict}</span>
+      </div>`;
+    })
+    .join('');
+
+  return `<p class="plog-summary">共 <b>${stats.games}</b> 场，其中 <b class="hl">${stats.hotGames}</b> 场达到打得好门槛</p>
+    <div class="plog-list">${head}${body}</div>`;
+}
+
+function rosterGameStatus(game) {  const meta = state.gameMeta.get(game.id) || {};
   if (game.state === 'live' && meta.halftime) return halftimeStatusText(meta.halftimeEndsAt);
   if (game.state === 'live' && meta.endPeriod) return breakStatusText(meta.breakEndsAt, game.period);
   if (game.state === 'live') return `${periodLabel(game.period)}${game.clock ? ' 剩 ' + game.clock : ''}`;
@@ -3202,7 +3468,7 @@ function renderGrid() {
       state.filterStatus === 'hot'
         ? `${emptyIcon()}
           <h3>还没有球员达到打得好门槛</h3>
-          <p>上场至少 ${HOT_MIN_MINUTES} 分钟，且满足任意 ${HOT_MIN_RULES} 项门槛后会出现在这里。</p>
+          <p>上场至少 ${HOT_MIN_MINUTES} 分钟，且满足任意 ${HOT_MIN_RULES} 项门槛后会出现在这里；出手 ≥${HOT_DQ_MIN_ATTEMPTS} 次但效率过低（真实命中率 <${HOT_DQ_MIN_TS}% 或得分 <${HOT_DQ_MIN_POINTS}）的场次一票否决。</p>
           <button class="text-btn" data-reset-filters>清除筛选</button>`
         : `${emptyIcon()}
           <h3>当前筛选下没有球员</h3>
@@ -3277,7 +3543,7 @@ function cardHTML({ row, rank, isTop, leaderBadge }) {
   const hotStats = hotStatsFor(player.id);
   const verdict = hotVerdict(hotStats);
   const hotStatsLine = hotStats
-    ? `<div class="hot-stats ${verdict}">
+    ? `<div class="hot-stats ${verdict}" title="${esc(HOT_SEASON_NOTE)}">
         <span class="hs-label">赛季火热</span>
         <span class="hs-count"><b>${hotStats.hotGames}</b>/${hotStats.games} 场</span>
         <span class="hs-verdict">${
@@ -3288,10 +3554,20 @@ function cardHTML({ row, rank, isTop, leaderBadge }) {
               : '尚未达标'
         }</span>
       </div>`
-    : '';
+    : row.played && state.hotStatsLoading
+      ? `<div class="hot-stats pending" title="正在拉取该球员本赛季的逐场数据">
+          <span class="hs-label">赛季火热</span>
+          <span class="hs-count">统计中…</span>
+        </div>`
+      : row.played && state.hotStatsLoaded
+        ? `<div class="hot-stats none" title="本赛季暂无可用场次，或逐场数据拉取失败">
+            <span class="hs-label">赛季火热</span>
+            <span class="hs-count">暂无数据</span>
+          </div>`
+        : '';
   const foot = row.played
     ? `<span>投篮 ${row.stats.fgm}-${row.stats.fga} · 三分 ${row.stats.tpm}-${row.stats.tpa} · 罚球 ${row.stats.ftm}-${row.stats.fta}</span>
-       <span class="foot-sub"><span class="foot-item${state.sortKey === 'offRebounds' ? ' focus' : ''}">前板 ${row.stats.oreb}</span> · 后板 ${row.stats.dreb} · 失误 ${row.stats.tov} · <span class="foot-item${state.sortKey === 'plusMinus' ? ' focus' : ''}">正负 ${esc(fmtSigned(row.stats.plusMinus))}</span></span>`
+       <span class="foot-sub"><span class="foot-item${state.sortKey === 'offRebounds' ? ' focus' : ''}">前板 ${row.stats.oreb}</span> · 后板 ${row.stats.dreb} · 失误 ${row.stats.tov} · <span class="foot-item${state.sortKey === 'plusMinus' ? ' focus' : ''}${row.hot?.some((r) => r.key === 'pm') ? ' hit' : ''}">正负 ${esc(fmtSigned(row.stats.plusMinus))}</span></span>`
     : row.state === 'bench'
       ? `未上场${row.reason ? ' · ' + esc(row.reason) : ' · 未获得出场时间'}`
       : row.state === 'pre'
@@ -3304,11 +3580,11 @@ function cardHTML({ row, rank, isTop, leaderBadge }) {
             ? playerPendingText(row.game.id)
             : '技术统计同步中';
 
-  return `<article id="card-${esc(player.id)}" class="card ${row.played ? 'is-played' : 'is-bench'}${
+  return `<article id="card-${esc(player.id)}" data-player-id="${esc(player.id)}" class="card ${row.played ? 'is-played' : 'is-bench'}${
     isTop ? ' is-top' : ''
   }${row.hot ? ' is-hot' : ''}" style="--team-color:${color}" title="${esc(
     player.name
-  )}${hotLabel ? ' · 打得好：' + esc(hotLabel) : ''}">
+  )}${hotLabel ? ' · 打得好：' + esc(hotLabel) : row.dq ? ' · 不计入打得好：' + esc(row.dq) : ''}">
     <div class="card-head">
       ${avatarHTML(player, { color, rank })}
       <div class="who">
@@ -3325,8 +3601,8 @@ function cardHTML({ row, rank, isTop, leaderBadge }) {
       </div>
     </div>
     ${gameLineHTML(row)}
-    <div class="stats">${row.played ? statCells(row.stats) : emptyStatCells()}</div>
-    ${row.played ? advCells(row.stats) : ''}
+    <div class="stats">${row.played ? statCells(row.stats, row.hot) : emptyStatCells()}</div>
+    ${row.played ? advCells(row.stats, row.hot) : ''}
     ${hotStatsLine}
     <div class="card-foot">${foot}</div>
   </article>`;
@@ -3380,15 +3656,41 @@ function gameLineHTML(row) {
   </div>`;
 }
 
-function statCells(stats) {
-  return statGrid([
-    ['points', '得分', stats.pts],
-    ['rebounds', '篮板', stats.reb],
-    ['assists', '助攻', stats.ast],
-    ['steals', '抢断', stats.stl],
-    ['blocks', '盖帽', stats.blk],
-    ['minutes', '分钟', Math.round(stats.minutes)],
-  ]);
+/** 把命中的维度映射到具体的数据格子，用于标亮 */
+function hitCells(stats, reasons) {
+  const hit = new Set();
+  for (const reason of reasons || []) {
+    if (reason.key === 'pts') hit.add('points');
+    else if (reason.key === 'reb') hit.add('rebounds');
+    else if (reason.key === 'ast') hit.add('assists');
+    else if (reason.key === 'stocks') {
+      // 断帽是合计达标，两格都亮
+      hit.add('steals');
+      hit.add('blocks');
+    } else if (reason.key === 'dd' || reason.key === 'td') {
+      // 两双/三双：亮出上双的那几格
+      if (stats.pts >= 10) hit.add('points');
+      if (stats.reb >= 10) hit.add('rebounds');
+      if (stats.ast >= 10) hit.add('assists');
+      if (stats.stl >= 10) hit.add('steals');
+      if (stats.blk >= 10) hit.add('blocks');
+    }
+  }
+  return hit;
+}
+
+function statCells(stats, reasons) {
+  return statGrid(
+    [
+      ['points', '得分', stats.pts],
+      ['rebounds', '篮板', stats.reb],
+      ['assists', '助攻', stats.ast],
+      ['steals', '抢断', stats.stl],
+      ['blocks', '盖帽', stats.blk],
+      ['minutes', '分钟', Math.round(stats.minutes)],
+    ],
+    hitCells(stats, reasons)
+  );
 }
 
 function emptyStatCells() {
@@ -3402,30 +3704,33 @@ function emptyStatCells() {
   ]);
 }
 
-function statGrid(cells) {
+function statGrid(cells, hit) {
   return cells
-    .map(
-      ([key, label, value]) =>
-        `<div class="stat${state.sortKey === key ? ' main' : ''}"><b>${value}</b><span>${label}</span></div>`
-    )
+    .map(([key, label, value]) => {
+      const classes = ['stat'];
+      if (state.sortKey === key) classes.push('main');
+      if (hit && hit.has(key)) classes.push('hit');
+      return `<div class="${classes.join(' ')}"><b>${value}</b><span>${label}</span></div>`;
+    })
     .join('');
 }
 
-function advCells(stats) {
+function advCells(stats, reasons) {
+  const hitKeys = new Set((reasons || []).map((reason) => reason.key));
   const cells = [
     {
       key: 'ts',
       label: '真实命中率 TS%',
       value: fmtPct(stats.ts),
       title: '真实命中率 = 得分 / (2 × (出手 + 0.44 × 罚球出手))，按本场数据估算',
-      tone: stats.ts != null && stats.ts >= 60 ? 'good' : '',
+      hit: hitKeys.has('ts'),
     },
     {
       key: 'efg',
       label: '有效命中率 eFG%',
       value: fmtPct(stats.efg),
       title: '有效命中率 = (命中 + 0.5 × 三分命中) / 出手',
-      tone: stats.efg != null && stats.efg >= 55 ? 'good' : '',
+      tone: '',
     },
     {
       key: 'usg',
@@ -3453,7 +3758,7 @@ function advCells(stats) {
       label: '效率值 EFF',
       value: String(stats.eff),
       title: '单场效率值：得分 + 篮板 + 助攻 + 抢断 + 盖帽 − 投失 − 罚失 − 失误',
-      tone: stats.eff >= 20 ? 'good' : stats.eff < 0 ? 'bad' : '',
+      tone: stats.eff < 0 ? 'bad' : '',
     },
   ];
 
@@ -3461,8 +3766,8 @@ function advCells(stats) {
     .map(
       (cell) =>
         `<div class="adv-cell${cell.tone ? ' ' + cell.tone : ''}${
-          state.sortKey === cell.key ? ' focus' : ''
-        }" title="${esc(cell.title)}"><span>${cell.label}</span><b>${cell.value}</b></div>`
+          cell.hit ? ' hit' : ''
+        }${state.sortKey === cell.key ? ' focus' : ''}" title="${esc(cell.title)}"><span>${cell.label}</span><b>${cell.value}</b></div>`
     )
     .join('')}</div>`;
 }

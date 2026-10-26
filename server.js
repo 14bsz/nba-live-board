@@ -335,6 +335,7 @@ const CACHE_TTL_LIVE = 8 * 1000; // 进行中
 const CACHE_TTL_UPCOMING = 60 * 1000; // 未开始（只有赛程信息）
 const CACHE_TTL_HISTORY = 6 * 60 * 60 * 1000; // 历史日期比分板 / 该日已全部结束
 const CACHE_TTL_STATIC_DATA = 24 * 60 * 60 * 1000; // 球员搜索：名单几乎不变
+const CACHE_TTL_GAMELOG = 5 * 60 * 1000; // 赛季逐场数据：每打完一场就变
 const CACHE_TTL_DEFAULT = 10 * 1000;
 
 const PROXY_CACHE_MAX = 600;
@@ -491,6 +492,13 @@ function scoreboardTTL(rest, json) {
 }
 
 function decideCacheTTL(rest, body, encoding) {
+  // gamelog 每打完一场就变，不能跟着名单类数据吃长缓存，
+  // 否则新比赛要等一天才进赛季统计。
+  if (/\/athletes\/[^/]+\/gamelog/.test(rest)) return CACHE_TTL_GAMELOG;
+
+  // 球员搜索：名单几乎不变，可以长缓存
+  if (/\/search\?/.test(rest)) return CACHE_TTL_STATIC_DATA;
+
   if (rest.startsWith('web/')) return CACHE_TTL_STATIC_DATA;
 
   const json = inspectJson(body, encoding);
@@ -642,8 +650,214 @@ function handleEspnProxy(request, response, rest) {
   proxyRequest.end();
 }
 
+/* ---------- 正负值补查：按「比赛」维度批量取 +/- ---------- */
+
+// 赛季逐场数据（gamelog）没有正负值字段，只有 summary 的 boxscore 里才有。
+// 逐场逐人去查代价太大，这里按比赛维度批量取并落盘：
+// 一场只拉一次、所有关注球员共享，终场后数据不再变化，可以直接复用。
+const PLUSMINUS_DIR = path.join(DATA_DIR, 'plusminus');
+const PLUSMINUS_MAX_EVENTS = 40; // 单次请求上限，防止被当成开放抓取口
+const PLUSMINUS_CONCURRENCY = 4;
+const PLUSMINUS_MAX_INFLIGHT = 6; // 全局同时向 ESPN 发起的抓取上限
+const PLUSMINUS_TTL_LIVE = 2 * 60 * 1000; // 进行中的比赛正负值还会变
+
+const plusMinusCache = new Map(); // eventId -> { at, state, players: { playerId: +/- } }
+const plusMinusPending = new Map(); // eventId -> Promise，合并同一场的并发抓取
+
+// 简单信号量：关注球员多时，多个请求会同时补查，需要压住对 ESPN 的并发
+let plusMinusInflight = 0;
+const plusMinusWaiters = [];
+
+function acquirePlusMinusSlot() {
+  if (plusMinusInflight < PLUSMINUS_MAX_INFLIGHT) {
+    plusMinusInflight += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => plusMinusWaiters.push(resolve));
+}
+
+function releasePlusMinusSlot() {
+  const next = plusMinusWaiters.shift();
+  if (next) next();
+  else plusMinusInflight -= 1;
+}
+
+function plusMinusPath(eventId) {
+  return path.join(PLUSMINUS_DIR, eventId + '.json');
+}
+
+function loadPlusMinusFromDisk() {
+  try {
+    if (!fs.existsSync(PLUSMINUS_DIR)) return;
+    for (const name of fs.readdirSync(PLUSMINUS_DIR)) {
+      if (!name.endsWith('.json')) continue;
+      const eventId = name.slice(0, -5);
+      if (!/^\d+$/.test(eventId)) continue;
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(PLUSMINUS_DIR, name), 'utf8'));
+        if (data && data.players) plusMinusCache.set(eventId, data);
+      } catch {
+        /* 单条损坏就跳过，不影响启动 */
+      }
+    }
+  } catch {
+    /* 目录不可读时当作空缓存 */
+  }
+}
+
+function savePlusMinus(eventId, entry) {
+  plusMinusCache.set(eventId, entry);
+  // 只有终场数据值得落盘：它不会再变，下次启动直接复用
+  if (entry.state !== 'post') return;
+  fs.mkdir(PLUSMINUS_DIR, { recursive: true }, () => {
+    fs.writeFile(plusMinusPath(eventId), JSON.stringify(entry), () => {});
+  });
+}
+
+/** 拉一个 JSON 并解压；不复用 proxyCache，因为这里需要解析后的对象 */
+function requestEspnJson(hostKey, reqPath) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: ESPN_HOSTS[hostKey],
+        path: reqPath,
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0',
+          Accept: 'application/json',
+          'Accept-Encoding': 'gzip, deflate',
+        },
+        timeout: 20000,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks);
+          let body = raw;
+          try {
+            const encoding = String(res.headers['content-encoding'] || '');
+            if (/gzip/i.test(encoding)) body = zlib.gunzipSync(raw);
+            else if (/deflate/i.test(encoding)) body = zlib.inflateSync(raw);
+          } catch {
+            /* 解压失败就按原始体解析 */
+          }
+          if (res.statusCode !== 200) {
+            reject(new Error('ESPN ' + res.statusCode));
+            return;
+          }
+          try {
+            resolve(JSON.parse(body.toString('utf8')));
+          } catch (error) {
+            reject(error);
+          }
+        });
+        res.on('error', reject);
+      }
+    );
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/** 从 summary 的 boxscore 里提取两队全部球员的正负值 */
+function extractPlusMinus(summary) {
+  const players = {};
+  for (const team of summary?.boxscore?.players || []) {
+    for (const stat of team.statistics || []) {
+      const keys = stat.keys || [];
+      const idx = keys.indexOf('plusMinus');
+      if (idx < 0) continue;
+      for (const entry of stat.athletes || []) {
+        const id = entry?.athlete?.id;
+        if (!id || !Array.isArray(entry.stats)) continue;
+        const value = Number(entry.stats[idx]);
+        if (Number.isFinite(value)) players[String(id)] = value;
+      }
+    }
+  }
+  return players;
+}
+
+async function resolvePlusMinus(eventId) {
+  const cached = plusMinusCache.get(eventId);
+  if (cached) {
+    if (cached.state === 'post') return cached;
+    if (Date.now() - cached.at < PLUSMINUS_TTL_LIVE) return cached;
+  }
+
+  // 同一场比赛会被多个球员、多个请求同时要，合并成一次抓取
+  const pending = plusMinusPending.get(eventId);
+  if (pending) return pending;
+
+  const task = (async () => {
+    await acquirePlusMinusSlot();
+    try {
+      // 排队期间可能已被别的请求填好，再查一次避免重复抓
+      const again = plusMinusCache.get(eventId);
+      if (again && (again.state === 'post' || Date.now() - again.at < PLUSMINUS_TTL_LIVE)) {
+        return again;
+      }
+      const summary = await requestEspnJson(
+        'site',
+        '/apis/site/v2/sports/basketball/nba/summary?event=' + encodeURIComponent(eventId)
+      );
+      const entry = {
+        at: Date.now(),
+        state: summary?.header?.competitions?.[0]?.status?.type?.state || 'post',
+        players: extractPlusMinus(summary),
+      };
+      savePlusMinus(eventId, entry);
+      return entry;
+    } catch {
+      // 取不到就返回空表，前端按「无正负值」处理，不影响主流程
+      return { at: Date.now(), state: 'error', players: {} };
+    } finally {
+      releasePlusMinusSlot();
+    }
+  })().finally(() => plusMinusPending.delete(eventId));
+
+  plusMinusPending.set(eventId, task);
+  return task;
+}
+
+async function handlePlusMinus(response, query) {
+  const params = new URLSearchParams(query.startsWith('?') ? query : '?' + query);
+  const ids = [
+    ...new Set(
+      String(params.get('events') || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter((item) => /^\d{6,12}$/.test(item))
+    ),
+  ];
+  if (!ids.length) {
+    sendJson(response, 400, { error: 'events 参数为空' });
+    return;
+  }
+  if (ids.length > PLUSMINUS_MAX_EVENTS) {
+    sendJson(response, 400, { error: `单次最多查询 ${PLUSMINUS_MAX_EVENTS} 场` });
+    return;
+  }
+
+  const result = {};
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(PLUSMINUS_CONCURRENCY, ids.length) }, async () => {
+    while (cursor < ids.length) {
+      const id = ids[cursor];
+      cursor += 1;
+      const entry = await resolvePlusMinus(id);
+      result[id] = entry.players;
+    }
+  });
+  await Promise.all(workers);
+  sendJson(response, 200, result);
+}
+
 ensureStore();
 loadProxyCacheFromDisk();
+loadPlusMinusFromDisk();
 
 http
   .createServer(async (request, response) => {
@@ -660,6 +874,10 @@ http
     }
 
     try {
+      if (pathname === '/api/plusminus') {
+        await handlePlusMinus(response, query);
+        return;
+      }
       if (pathname.startsWith('/api/espn/')) {
         handleEspnProxy(request, response, pathname.slice('/api/espn/'.length) + query);
         return;
