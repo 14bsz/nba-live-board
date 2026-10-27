@@ -483,7 +483,9 @@ img {
 .hot-stats {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 7px;
+  row-gap: 2px;
   margin-top: 8px;
   padding: 6px 9px;
   font-size: 11px;
@@ -493,8 +495,9 @@ img {
 }
 
 .hot-stats .hs-label {
-  color: var(--dim);
+  font-weight: 700;
   letter-spacing: 0.3px;
+  color: var(--dim);
 }
 
 /* 赛季统计还没拉完时的占位，避免这一行整块消失让人以为功能没了 */
@@ -525,19 +528,38 @@ img {
   color: var(--text);
 }
 
-.hot-stats .hs-verdict {
+.hot-stats .hs-form {
   margin-left: auto;
   font-weight: 700;
   white-space: nowrap;
 }
 
-.hot-stats.stable {
+/* 赛季画像：颜色区分「火热 / 稳定 / 神经刀 / 昙花一现」 */
+.hot-stats.hot {
+  background: rgba(255, 122, 26, 0.09);
+  border-color: rgba(255, 122, 26, 0.3);
+}
+
+.hot-stats.hot .hs-label {
+  color: var(--accent-soft);
+}
+
+.hot-stats.steady {
   background: rgba(46, 224, 122, 0.08);
   border-color: rgba(46, 224, 122, 0.28);
 }
 
-.hot-stats.stable .hs-verdict {
+.hot-stats.steady .hs-label {
   color: var(--live);
+}
+
+.hot-stats.cold {
+  background: rgba(255, 91, 91, 0.08);
+  border-color: rgba(255, 91, 91, 0.26);
+}
+
+.hot-stats.cold .hs-label {
+  color: #ff8a8a;
 }
 
 .hot-stats.flash {
@@ -545,11 +567,20 @@ img {
   border-color: rgba(255, 196, 61, 0.26);
 }
 
-.hot-stats.flash .hs-verdict {
+.hot-stats.flash .hs-label {
   color: #ffc43d;
 }
 
-.hot-stats.none .hs-verdict {
+/* 状态趋势只上色，不抢画像的主视觉 */
+.hot-stats .hs-form.hot {
+  color: var(--accent-soft);
+}
+
+.hot-stats .hs-form.cold {
+  color: #ff8a8a;
+}
+
+.hot-stats .hs-form.plain {
   color: var(--dim);
 }
 
@@ -567,6 +598,63 @@ img {
 .threshold-field input:focus-visible {
   outline: none;
   border-color: rgba(255, 154, 61, 0.5);
+}
+
+.threshold-control {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.threshold-preset {
+  padding: 4px 7px;
+  font-size: 11px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.threshold-preset:hover {
+  color: var(--text);
+}
+
+.threshold-preset.active {
+  color: #251200;
+  font-weight: 700;
+  background: linear-gradient(135deg, #ffcf5c, #ff8a1f);
+}
+
+.threshold-control input {
+  width: 40px;
+  padding: 4px 5px;
+  font-size: 11px;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-left: 1px solid var(--line);
+  border-radius: 0;
+  text-align: center;
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+/* 去掉数字框的上下箭头，40px 才装得下两位数 */
+.threshold-control input::-webkit-outer-spin-button,
+.threshold-control input::-webkit-inner-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
+}
+
+.threshold-control input:focus-visible {
+  outline: none;
+  background: var(--panel-2);
+  border-radius: 6px;
 }
 
 .sum-note {
@@ -1776,6 +1864,18 @@ body.hscroll-dragging * {
   border-radius: 999px;
 }
 
+.cold-badge {
+  flex: none;
+  padding: 2.5px 6px;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  color: #ffb3b3;
+  background: rgba(255, 91, 91, 0.14);
+  border: 1px solid rgba(255, 91, 91, 0.36);
+  border-radius: 999px;
+}
+
 .meta {
   display: flex;
   align-items: center;
@@ -2376,6 +2476,10 @@ body.hscroll-dragging * {
   color: var(--accent-soft);
 }
 
+.plog-summary b.cold {
+  color: #ff8a8a;
+}
+
 .plog-list {
   display: flex;
   flex-direction: column;
@@ -2469,6 +2573,10 @@ body.hscroll-dragging * {
   color: var(--accent-soft);
 }
 
+.plog-row.is-bad .plog-line b {
+  color: #f09595;
+}
+
 .plog-def,
 .plog-min,
 .plog-ts {
@@ -2491,13 +2599,15 @@ body.hscroll-dragging * {
   border: 1px solid rgba(255, 122, 26, 0.42);
 }
 
-.plog-tag.dq {
-  color: #b4b2a9;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid var(--line);
+.plog-tag.cold {
+  color: #ffb3b3;
+  font-weight: 700;
+  background: rgba(255, 91, 91, 0.14);
+  border: 1px solid rgba(255, 91, 91, 0.36);
 }
 
 .plog-tag.none {
+  padding: 1px 0;
   color: var(--dim);
 }
 
@@ -2567,6 +2677,22 @@ button.plog-row.is-open.is-hot {
 
 .plog-detail .stats {
   margin-top: 0;
+}
+
+.plog-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.plog-detail-why {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10.5px;
+  color: var(--dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .plog-detail .adv {

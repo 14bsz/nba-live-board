@@ -36,10 +36,10 @@ const TIMEOUT_VISIBLE_MS = 2 * 60 * 1000;
 const HOT_MIN_MINUTES = 10;
 const HOT_MIN_RULES = 2;
 // 判定规则版本：门槛口径一改就递增，让赛季统计的旧缓存自动作废
-const HOT_RULES_VERSION = 5; // 5：缓存增加逐场明细（log）；4：得分门槛 20→15 + 效率否决
+const HOT_RULES_VERSION = 6; // 6：三层判定（20 分门槛 + 防刷子 + 打得差 + 赛季画像）
 
 const HOT_RULES = [
-  { key: 'pts', label: '15+分', test: (stats) => stats.pts >= 15 },
+  { key: 'pts', label: '20+分', test: (stats) => stats.pts >= 20 },
   { key: 'reb', label: '8+板', test: (stats) => stats.reb >= 8 },
   { key: 'ast', label: '6+助', test: (stats) => stats.ast >= 6 },
   { key: 'stocks', label: '3+断帽', test: (stats) => stats.stl + stats.blk >= 3 },
@@ -48,30 +48,51 @@ const HOT_RULES = [
     label: 'TS 60%+',
     test: (stats) => stats.fga >= 8 && stats.ts != null && stats.ts >= 60,
   },
-  {
-    key: 'pm',
-    label: '正负+10',
-    test: (stats) => stats.plusMinus != null && stats.plusMinus >= 10,
-  },
 ];
 
-// 一票否决：出手不少却几乎没产出，这种场次防守数据再好看也不该算「打得好」。
-// 典型反例：22 分钟 7 投 0 中得 0 分、抢 8 个板，按纯达标项会被算成好球。
-const HOT_DQ_MIN_ATTEMPTS = 5; // 出手次数达到该值才进入否决判断
-const HOT_DQ_MIN_TS = 40; // 真实命中率低于该值视为进攻熄火
-const HOT_DQ_MIN_POINTS = 5; // 得分低于该值同样视为熄火
+// 正负值：gamelog 里没有，只能补查；它不单独计入达标项，
+// 只用来把「差一项达标」的场次补成打得好（见 parseGamelog）。
+const HOT_PM_RULE = {
+  key: 'pm',
+  label: '正负+10',
+  test: (stats) => stats.plusMinus != null && stats.plusMinus >= 10,
+};
+
+// 防刷子：出手不少却效率很低，达标项再多也不算打得好。
+// 典型反例：30 分但 28 投，真实命中率不到 50%。
+const PAD_MIN_ATTEMPTS = 10;
+const PAD_MAX_TS = 50;
+
+// 打得差：进攻端明确拖后腿。和打得好一样只看逐场日志，0 额外请求。
+const BAD_MIN_ATTEMPTS = 5; // 出手达到该值，效率过低即算差
+const BAD_MAX_TS = 40;
+const BAD_MAX_POINTS = 5; // 低得分 + 时间不少 + 板助也少
+const BAD_MIN_MINUTES = 15;
+const BAD_MAX_REB_AST = 5;
+
+// 近 10 场状态：窗口固定 10 场，好/差场次达到下限就贴趋势标签
+const FORM_WINDOW = 10;
+const FORM_HOT_MIN = 5;
+const FORM_BAD_MIN = 4;
+
+// 赛季画像：先看样本量，再按火热率 / 波动性排优先级
+const PROFILE_MIN_GAMES = 5; // 出场不足就是「样本不足」
+const PROFILE_MIN_RATE = 50; // 赛季火热要求达标率不低于 50%
+const STEADY_MIN_GAMES = 20; // 稳定核是固定口径，不随阈值变化
+const STEADY_MIN_RATE = 50;
+const STEADY_MAX_BAD = 3;
+const FLASH_MIN_GAMES = 10; // 昙花一现：场次够多但达标极少
+const FLASH_MAX_HOT = 2;
 
 const HOT_CRITERIA_TEXT =
-  `上场至少 ${HOT_MIN_MINUTES} 分钟，满足任意 ${HOT_MIN_RULES} 项即算打得好：15+分、8+篮板、6+助攻、` +
-  '3+抢断盖帽、真实命中率≥60%（至少8次出手）、正负值≥+10、两双/三双。' +
-  `\n否决条件：出手 ≥${HOT_DQ_MIN_ATTEMPTS} 次且真实命中率 <${HOT_DQ_MIN_TS}%，或出手 ≥${HOT_DQ_MIN_ATTEMPTS} 次且得分 <${HOT_DQ_MIN_POINTS}，一律不算。`;
+  `上场至少 ${HOT_MIN_MINUTES} 分钟，满足任意 ${HOT_MIN_RULES} 项即算打得好：20+分、8+篮板、6+助攻、` +
+  '3+抢断盖帽、真实命中率≥60%（至少8次出手）、两双/三双；正负值≥+10 可补足只差一项的场次。' +
+  `\n防刷子：出手 ≥${PAD_MIN_ATTEMPTS} 次且真实命中率 <${PAD_MAX_TS}%，达标项再多也不算打得好。` +
+  `\n打得差：出手 ≥${BAD_MIN_ATTEMPTS} 次且真实命中率 <${BAD_MAX_TS}%，或出场 ≥${BAD_MIN_MINUTES} 分钟却不到 ${BAD_MAX_POINTS} 分且篮板助攻合计 <${BAD_MAX_REB_AST}。`;
 
 // 赛季逐场统计的口径说明：正负值要额外补查，见 parseGamelog
 const HOT_SEASON_NOTE =
-  '赛季场次按同一套门槛逐场统计（含效率否决条件），正负值取自逐场技术统计，仅对差一项达标的场次补查。';
-
-// 第一遍打分用的规则集：先不判正负值，等补查结果回来再定论
-const HOT_RULES_SEASON = HOT_RULES.filter((rule) => rule.key !== 'pm');
+  '逐场判定只看当场技术统计；近 10 场看近期状态，全赛季按阈值看画像。正负值仅对差一项达标的场次补查。';
 
 const CN_TEAMS = {
   ATL: '老鹰', BKN: '篮网', BOS: '凯尔特人', CHA: '黄蜂', CHI: '公牛', CLE: '骑士',
@@ -264,7 +285,7 @@ const BAG_PLAYERS = [
 
 const HOT_STATS_KEY = 'nba-stand-hot-stats-v1';
 const HOT_THRESHOLD_KEY = 'nba-stand-hot-threshold-v1';
-const DEFAULT_HOT_THRESHOLD = 5;
+const DEFAULT_HOT_THRESHOLD = 10; // 平衡模式
 // 赛季火热场次缓存有效期。不能按「美东日期」判活：
 // 美东同一天里可能先有比赛结束，日期没变但数据已经变了。
 const HOT_STATS_TTL_MS = 60 * 60 * 1000;
@@ -720,6 +741,7 @@ async function init() {
   el.teamFilter = document.getElementById('teamFilter');
   el.sortSelect = document.getElementById('sortSelect');
   el.hotThreshold = document.getElementById('hotThreshold');
+  el.thresholdPresets = document.getElementById('thresholdPresets');
   el.sortDirBtn = document.getElementById('sortDirBtn');
   el.updatedAt = document.getElementById('updatedAt');
   el.grid = document.getElementById('grid');
@@ -752,6 +774,8 @@ async function init() {
   applyImportOnce();
   applyBagImportOnce();
   state.hotThreshold = loadHotThreshold();
+  if (el.hotThreshold) el.hotThreshold.value = String(state.hotThreshold);
+  syncThresholdPresets();
   state.view = loadView();
   buildSortSelect();
   bindEvents();
@@ -871,15 +895,10 @@ function bindEvents() {
     if (chip) applySort(chip.dataset.leaderSort);
   });
 
-  el.hotThreshold.addEventListener('change', () => {
-    const value = Math.min(30, Math.max(1, Number(el.hotThreshold.value) || DEFAULT_HOT_THRESHOLD));
-    el.hotThreshold.value = String(value);
-    state.hotThreshold = value;
-    saveHotThreshold(value);
-    renderSummary();
-    renderFilters();
-    renderGrid();
-    showToast(`火热阈值已设为 ${value} 场`);
+  el.hotThreshold.addEventListener('change', () => setHotThreshold(el.hotThreshold.value));
+  el.thresholdPresets?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-threshold]');
+    if (button) setHotThreshold(button.dataset.threshold);
   });
 
   el.sortDirBtn.addEventListener('click', () => {
@@ -1101,6 +1120,7 @@ function applyCloudData(data) {
       /* ignore */
     }
     if (el.hotThreshold) el.hotThreshold.value = String(data.hotThreshold);
+    syncThresholdPresets();
     applied = true;
   }
   if (data.view === 'teams' || data.view === 'players') {
@@ -1377,17 +1397,78 @@ function saveHotThreshold(value) {
   scheduleCloudSync();
 }
 
+/** 阈值一变，赛季画像会整体重算：标记预设档位并重绘卡片和筛选计数 */
+function setHotThreshold(value) {
+  const next = Math.min(30, Math.max(1, Number(value) || DEFAULT_HOT_THRESHOLD));
+  if (el.hotThreshold) el.hotThreshold.value = String(next);
+  const changed = next !== state.hotThreshold;
+  state.hotThreshold = next;
+  syncThresholdPresets();
+  saveHotThreshold(next);
+  if (!changed) return;
+  renderSummary();
+  renderFilters();
+  renderGrid();
+  showToast(`火热阈值已设为 ${next} 场`);
+}
+
+function syncThresholdPresets() {
+  if (!el.thresholdPresets) return;
+  el.thresholdPresets.querySelectorAll('[data-threshold]').forEach((button) => {
+    const active = Number(button.dataset.threshold) === state.hotThreshold;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+}
+
 function hotStatsFor(id) {
   const stats = state.hotStats[String(id)];
   return stats && stats.games ? stats : null;
 }
 
-/** stable = 达标且达到阈值；flash = 达标但没到阈值；none = 一次都没达标 */
-function hotVerdict(stats) {
-  if (!stats || !stats.games) return 'none';
-  if (stats.hotGames >= state.hotThreshold) return 'stable';
-  if (stats.hotGames > 0) return 'flash';
-  return 'none';
+/**
+ * 第三层：赛季画像。优先级从高到低——样本不足 → 赛季火热 → 神经刀 →
+ * 稳定核 → 昙花一现 → 平庸。只有阈值参与「火热/神经刀」的判定，
+ * 稳定核和昙花一现用的是固定口径。
+ */
+function seasonProfile(stats) {
+  if (!stats || !stats.games) return null;
+  const games = stats.games;
+  const hot = stats.hotGames || 0;
+  const bad = stats.badGames || 0;
+  const rate = games ? (hot / games) * 100 : 0;
+  const threshold = state.hotThreshold;
+  const base = { games, hot, bad, rate };
+
+  if (games < PROFILE_MIN_GAMES) return { ...base, key: 'sample', label: '样本不足', tone: 'plain' };
+  if (hot >= threshold && rate >= PROFILE_MIN_RATE) {
+    return { ...base, key: 'hot', label: '赛季火热', tone: 'hot' };
+  }
+  if (hot >= threshold && bad >= threshold) {
+    return { ...base, key: 'volatile', label: '神经刀', tone: 'cold' };
+  }
+  if (games >= STEADY_MIN_GAMES && rate >= STEADY_MIN_RATE && bad <= STEADY_MAX_BAD) {
+    return { ...base, key: 'steady', label: '稳定核', tone: 'steady' };
+  }
+  if (games >= FLASH_MIN_GAMES && hot <= FLASH_MAX_HOT) {
+    return { ...base, key: 'flash', label: '昙花一现', tone: 'flash' };
+  }
+  return { ...base, key: 'plain', label: '平庸', tone: 'plain' };
+}
+
+/** 第二层：只看最近 10 场的好/差场次，和阈值无关 */
+function seasonForm(stats) {
+  const log = stats?.log;
+  if (!Array.isArray(log) || !log.length) return null;
+  const recent = log.slice(0, FORM_WINDOW);
+  const games = recent.length;
+  const good = recent.filter((game) => game.hot).length;
+  const bad = recent.filter((game) => game.bad).length;
+  const base = { games, good, bad };
+  if (games < PROFILE_MIN_GAMES) return { ...base, key: 'sample', label: '样本不足', tone: 'plain' };
+  if (good >= FORM_HOT_MIN) return { ...base, key: 'hot', label: '近期火热', tone: 'hot' };
+  if (bad >= FORM_BAD_MIN) return { ...base, key: 'cold', label: '近期低迷', tone: 'cold' };
+  return { ...base, key: 'calm', label: '状态平稳', tone: 'plain' };
 }
 
 function parsePair(value) {
@@ -1446,7 +1527,7 @@ async function parseGamelog(data, playerId) {
   labels.forEach((label, position) => {
     index[label] = position;
   });
-  const result = { games: 0, hotGames: 0, hotDates: [], log: [] };
+  const result = { games: 0, hotGames: 0, badGames: 0, hotDates: [], log: [] };
   if (index['PTS'] === undefined) return result;
 
   const events = data.events || {};
@@ -1465,15 +1546,15 @@ async function parseGamelog(data, playerId) {
         if (stats.minutes == null || stats.minutes <= 0) continue; // 未出场不计
         const eventId = String(entry?.eventId || fallbackId);
         const date = events[eventId]?.gameDate;
-        // 被否决的场次直接记 0 项，也就不必再为它补查正负值
-        const dq = hotDisqualifier(stats);
+        // 防刷子的场次直接记 0 项，也就不必再为它补查正负值
+        const padded = hotPadded(stats);
         rows.push({
           eventId,
           stats,
-          dq,
           date: date ? String(date).slice(0, 10) : null,
-          disqualified: dq != null,
-          reasons: dq ? [] : collectHotReasons(stats, HOT_RULES_SEASON) || [],
+          padded,
+          bad: badGameReason(stats),
+          reasons: padded ? [] : collectHotReasons(stats) || [],
         });
       }
     }
@@ -1482,7 +1563,9 @@ async function parseGamelog(data, playerId) {
 
   // 只有「差一项就达标」的场次，补上正负值才可能改变结论：
   // 0 项补了也只有 1 项，≥2 项本来就已经算数，这两类都不用查。
-  const needPlusMinus = rows.filter((row) => row.reasons.length === HOT_MIN_RULES - 1);
+  const needPlusMinus = rows.filter(
+    (row) => !row.bad && row.reasons.length === HOT_MIN_RULES - 1
+  );
   const plusMinus = needPlusMinus.length
     ? await fetchPlusMinus(needPlusMinus.map((row) => row.eventId))
     : {};
@@ -1495,11 +1578,13 @@ async function parseGamelog(data, playerId) {
         reasons.push({ key: 'pm', label: '正负+10' });
       }
     }
-    const isHot = reasons.length >= HOT_MIN_RULES;
+    const isHot = !row.bad && !row.padded && reasons.length >= HOT_MIN_RULES;
     if (isHot) {
       result.hotGames += 1;
       if (row.date) result.hotDates.push(row.date);
     }
+    const isBad = !isHot && !!row.bad;
+    if (isBad) result.badGames += 1;
 
     // 逐场明细：供卡片详情弹窗展示，字段名压到最短以控制缓存体积
     const meta = events[row.eventId] || {};
@@ -1517,10 +1602,12 @@ async function parseGamelog(data, playerId) {
       ast: s.ast,
       stl: s.stl,
       blk: s.blk,
+      fga: s.fga,
       ts: s.ts == null ? null : Math.round(s.ts * 10) / 10,
       hot: isHot,
+      bad: isBad,
+      why: isBad ? row.bad : null,
       k: reasons.map((reason) => reason.key),
-      dq: row.dq || null,
     });
   }
 
@@ -1589,7 +1676,7 @@ async function fetchHotStats(playerId) {
     const data = await fetchJSON(GAMELOG_API(playerId, currentSeasonYear()));
     return await parseGamelog(data, playerId);
   } catch (error) {
-    return { games: 0, hotGames: 0, hotDates: [] };
+    return { games: 0, hotGames: 0, badGames: 0, hotDates: [], log: [] };
   }
 }
 
@@ -1624,7 +1711,7 @@ async function loadHotStats(force = false) {
           try {
             state.hotStats[player.id] = await fetchHotStats(player.id);
           } catch (error) {
-            state.hotStats[player.id] = { games: 0, hotGames: 0, hotDates: [] };
+            state.hotStats[player.id] = { games: 0, hotGames: 0, badGames: 0, hotDates: [], log: [] };
           }
           done += 1;
           if (done % 10 === 0 || done === todo.length) {
@@ -1645,10 +1732,16 @@ async function loadHotStats(force = false) {
     }
 
     state.hotStatsLoaded = true;
-    const stable = stableRows().length;
-    const flash = flashRows().length;
-    if (stable + flash) {
-      showToast(`赛季火热：稳定 ${stable} 人 · 昙花一现 ${flash} 人（阈值 ${state.hotThreshold} 场）`);
+    // 画像分布：稳定 = 赛季火热 / 稳定核，其余按标签各算一档
+    const counts = { hot: 0, steady: 0, volatile: 0, flash: 0 };
+    for (const row of state.rows) {
+      const key = seasonProfile(hotStatsFor(row.player.id))?.key;
+      if (key && counts[key] != null) counts[key] += 1;
+    }
+    if (counts.hot + counts.steady + counts.volatile + counts.flash) {
+      showToast(
+        `赛季画像：稳定 ${counts.hot + counts.steady} 人 · 神经刀 ${counts.volatile} 人 · 昙花一现 ${counts.flash} 人（阈值 ${state.hotThreshold} 场）`
+      );
     }
   } catch (error) {
     // 拉取中途出错也要让卡片从「统计中」回到正常状态
@@ -1667,12 +1760,18 @@ async function loadHotStats(force = false) {
   }
 }
 
+/** 「稳定」筛选：赛季火热 + 稳定核（都要求达标率 ≥50%） */
+function isStableRow(row) {
+  const key = seasonProfile(hotStatsFor(row.player.id))?.key;
+  return key === 'hot' || key === 'steady';
+}
+
 function stableRows() {
-  return state.rows.filter((row) => hotVerdict(hotStatsFor(row.player.id)) === 'stable');
+  return state.rows.filter(isStableRow);
 }
 
 function flashRows() {
-  return state.rows.filter((row) => hotVerdict(hotStatsFor(row.player.id)) === 'flash');
+  return state.rows.filter((row) => seasonProfile(hotStatsFor(row.player.id))?.key === 'flash');
 }
 
 function savePlayers() {
@@ -1984,8 +2083,14 @@ function buildRows() {
       row.played = true;
       row.stats = stats;
       row.hot = hotReasons(stats);
-      // 达标项够了但被否决时记下原因，卡片悬停能看出为什么没打标
-      row.dq = row.hot ? null : hotDisqualifier(stats);
+      // 没打好时记下原因：卡片悬停能看出是打得差，还是单纯没达标
+      row.bad = row.hot ? null : badGameReason(stats);
+      row.dq =
+        row.hot || row.bad
+          ? null
+          : hotPadded(stats)
+            ? `出手 ${stats.fga} 次，真实命中率 ${stats.ts.toFixed(1)}%`
+            : null;
       row.state = game.state === 'live' ? 'live' : 'final';
       if (game.state === 'live') {
         row.onCourt = row.meta?.halftime || row.meta?.endPeriod ? false : stats.active;
@@ -2177,14 +2282,31 @@ function opponentTotals(summary, teamId) {
   return opponent ? teamTotals(summary, opponent.team?.id) : null;
 }
 
-/** 一票否决：命中返回原因文本，未命中返回 null */
-function hotDisqualifier(stats) {
-  if (!stats || stats.fga == null || stats.fga < HOT_DQ_MIN_ATTEMPTS) return null;
-  if (stats.ts != null && stats.ts < HOT_DQ_MIN_TS) {
-    return `出手 ${stats.fga} 次，真实命中率仅 ${stats.ts.toFixed(1)}%`;
+/** 防刷子：出手够多但效率很低，这种场次不算打得好（但也不一定有资格算打得差） */
+function hotPadded(stats) {
+  return (
+    !!stats &&
+    stats.fga != null &&
+    stats.fga >= PAD_MIN_ATTEMPTS &&
+    stats.ts != null &&
+    stats.ts < PAD_MAX_TS
+  );
+}
+
+/** 打得差：命中返回原因文本，未命中返回 null */
+function badGameReason(stats) {
+  if (!stats) return null;
+  const attempts = stats.fga || 0;
+  if (attempts >= BAD_MIN_ATTEMPTS && stats.ts != null && stats.ts < BAD_MAX_TS) {
+    return `出手 ${attempts} 次，真实命中率仅 ${stats.ts.toFixed(1)}%`;
   }
-  if (stats.pts < HOT_DQ_MIN_POINTS) {
-    return `出手 ${stats.fga} 次，仅得 ${stats.pts} 分`;
+  const minutes = stats.minutes || 0;
+  if (
+    stats.pts < BAD_MAX_POINTS &&
+    minutes >= BAD_MIN_MINUTES &&
+    (stats.reb || 0) + (stats.ast || 0) < BAD_MAX_REB_AST
+  ) {
+    return `${Math.round(minutes)} 分钟仅得 ${stats.pts} 分，篮板助攻合计不足 ${BAD_MAX_REB_AST}`;
   }
   return null;
 }
@@ -2207,12 +2329,12 @@ function collectHotReasons(stats, rules = HOT_RULES) {
 function hotReasons(stats, options = {}) {
   // 赛季逐场数据（gamelog）没有正负值字段，统计时先按不含该维度的规则打分，
   // 差一项达标的场次再由 fetchPlusMinus 补查后定论（见 parseGamelog）。
-  const rules = options.skipPlusMinus ? HOT_RULES_SEASON : HOT_RULES;
+  const rules = options.skipPlusMinus ? HOT_RULES : [...HOT_RULES, HOT_PM_RULE];
   const reasons = collectHotReasons(stats, rules);
   if (!reasons) return null;
   if (reasons.length < HOT_MIN_RULES) return null;
-  // 达标项够了也要过否决这一关：效率熄火的场次不能靠防守数据凑成好球
-  if (hotDisqualifier(stats)) return null;
+  // 达标项够了也要过防刷子这一关：出手多效率低的场次不能靠堆量凑成好球
+  if (hotPadded(stats)) return null;
   return reasons;
 }
 
@@ -2701,7 +2823,7 @@ function renderHotBar() {
     <div class="hotbar-head">
       <span class="hotbar-title">打得好</span>
       <span class="hotbar-count">${rows.length}</span>
-      <span class="hotbar-sub" title="${esc(HOT_CRITERIA_TEXT)}">上场≥${HOT_MIN_MINUTES}分钟 · 任意${HOT_MIN_RULES}项：15分/8板/6助/3断帽/TS60%/正负+10/两双</span>
+      <span class="hotbar-sub" title="${esc(HOT_CRITERIA_TEXT)}">上场≥${HOT_MIN_MINUTES}分钟 · 任意${HOT_MIN_RULES}项：20分/8板/6助/3断帽/TS60%/两双</span>
     </div>
     ${
       rows.length
@@ -3069,12 +3191,12 @@ function closeRosterModal({ restoreFocus = true } = {}) {
 /* ---------- 球员逐场记录弹窗 ---------- */
 
 const HOT_KEY_SHORT = {
-  pts: '得分',
-  reb: '篮板',
-  ast: '助攻',
-  stocks: '断帽',
-  ts: '效率',
-  pm: '正负',
+  pts: '20+分',
+  reb: '8+板',
+  ast: '6+助',
+  stocks: '3+断帽',
+  ts: 'TS≥60%',
+  pm: '正负+10',
   dd: '两双',
   td: '三双',
 };
@@ -3099,7 +3221,15 @@ function openPlayerModal(playerId) {
   const metaParts = [];
   if (name !== player.name) metaParts.push(player.name);
   if (teamName) metaParts.push(teamName);
-  if (stats) metaParts.push(`赛季 ${stats.hotGames}/${stats.games} 场达标`);
+  if (stats) {
+    const profile = seasonProfile(stats);
+    const form = seasonForm(stats);
+    metaParts.push(
+      `赛季 ${stats.hotGames}/${stats.games} 好${stats.badGames ? ` · ${stats.badGames} 差` : ''}`
+    );
+    if (profile) metaParts.push(profile.label);
+    if (form) metaParts.push(`近${form.games}场 ${form.label.replace('近期', '')}`);
+  }
 
   el.playerModalTitle.textContent = name;
   el.playerModalMeta.textContent = metaParts.join(' · ');
@@ -3154,12 +3284,13 @@ function playerLogHTML(stats) {
       if (game.hot) {
         const why = (game.k || []).map((key) => HOT_KEY_SHORT[key] || key).join('、');
         verdict = `<span class="plog-tag hot" title="${esc('达标维度：' + why)}">打得好</span>`;
-      } else if (game.dq) {
-        verdict = `<span class="plog-tag dq" title="${esc('一票否决：' + game.dq)}">不计</span>`;
+      } else if (game.bad) {
+        verdict = `<span class="plog-tag cold" title="${esc('打得差：' + (game.why || ''))}">打得差</span>`;
       } else {
-        verdict = '<span class="plog-tag none">—</span>';
+        verdict = '<span class="plog-tag none">中规中矩</span>';
       }
-      return `<button type="button" class="plog-row${game.hot ? ' is-hot' : ''}" data-plog-event="${esc(
+      const rowClass = game.hot ? ' is-hot' : game.bad ? ' is-bad' : '';
+      return `<button type="button" class="plog-row${rowClass}" data-plog-event="${esc(
         game.e || ''
       )}" aria-expanded="false" title="查看该场完整数据">
         <span class="plog-date">${esc(date)}</span>
@@ -3184,9 +3315,11 @@ function playerLogHTML(stats) {
     : null;
   const rate = games ? Math.round((stats.hotGames / games) * 100) : 0;
 
-  return `<p class="plog-summary">共 <b>${games}</b> 场 · 打得好 <b class="hl">${stats.hotGames}</b> 场（${rate}%）· 场均 <b>${avg(
-    'pts'
-  ).toFixed(1)}</b> 分 / <b>${avg('reb').toFixed(1)}</b> 板 / <b>${avg('ast').toFixed(1)}</b> 助 · TS <b>${
+  return `<p class="plog-summary">共 <b>${games}</b> 场 · 打得好 <b class="hl">${stats.hotGames}</b> 场（${rate}%）· 打得差 <b class="cold">${
+    stats.badGames || 0
+  }</b> 场 · 场均 <b>${avg('pts').toFixed(1)}</b> 分 / <b>${avg('reb').toFixed(
+    1
+  )}</b> 板 / <b>${avg('ast').toFixed(1)}</b> 助 · TS <b>${
     tsAvg == null ? '—' : tsAvg.toFixed(1) + '%'
   }</b></p>
     <p class="plog-hint">点任意一场展开该场完整数据</p>
@@ -3296,7 +3429,17 @@ function rememberPlogStats(eventId, stats) {
 function plogDetailHTML(game, stats) {
   const reasons = (game?.k || []).map((key) => ({ key }));
   const pmHit = reasons.some((reason) => reason.key === 'pm');
-  return `<div class="stats">${statCells(stats, reasons, { sorted: false })}</div>
+  const why = (game?.k || []).map((key) => HOT_KEY_SHORT[key] || key).join('、');
+  const verdict = game?.hot
+    ? `<div class="plog-detail-head"><span class="plog-tag hot">打得好</span><span class="plog-detail-why">${esc(
+        why
+      )}</span></div>`
+    : game?.bad
+      ? `<div class="plog-detail-head"><span class="plog-tag cold">打得差</span><span class="plog-detail-why">${esc(
+          game.why || ''
+        )}</span></div>`
+      : '';
+  return `${verdict}<div class="stats">${statCells(stats, reasons, { sorted: false })}</div>
     ${advCells(stats, reasons, { sorted: false })}
     <div class="card-foot">
       <span>投篮 ${stats.fgm}-${stats.fga} · 三分 ${stats.tpm}-${stats.tpa} · 罚球 ${stats.ftm}-${stats.fta}</span>
@@ -3612,7 +3755,7 @@ function renderGrid() {
       state.filterStatus === 'hot'
         ? `${emptyIcon()}
           <h3>还没有球员达到打得好门槛</h3>
-          <p>上场至少 ${HOT_MIN_MINUTES} 分钟，且满足任意 ${HOT_MIN_RULES} 项门槛后会出现在这里；出手 ≥${HOT_DQ_MIN_ATTEMPTS} 次但效率过低（真实命中率 <${HOT_DQ_MIN_TS}% 或得分 <${HOT_DQ_MIN_POINTS}）的场次一票否决。</p>
+          <p>上场至少 ${HOT_MIN_MINUTES} 分钟，且满足任意 ${HOT_MIN_RULES} 项门槛后会出现在这里；出手 ≥${PAD_MIN_ATTEMPTS} 次但真实命中率 <${PAD_MAX_TS}% 的场次会被防刷子挡掉。</p>
           <button class="text-btn" data-reset-filters>清除筛选</button>`
         : `${emptyIcon()}
           <h3>当前筛选下没有球员</h3>
@@ -3681,22 +3824,29 @@ function cardHTML({ row, rank, isTop, leaderBadge }) {
     ? `<span class="crown">${esc(leaderBadge || '得分王')}</span>`
     : row.hot
       ? `<span class="hot-badge" title="${esc('满足：' + hotLabel)}">打得好</span>`
-      : '';
+      : row.bad
+        ? `<span class="cold-badge" title="${esc('打得差：' + row.bad)}">打得差</span>`
+        : '';
   const bagTag =
     playerGroup(player) === 'bag' ? `<span class="bag-tag" title="来自我的背包">背包</span>` : '';
   const hotStats = hotStatsFor(player.id);
-  const verdict = hotVerdict(hotStats);
+  const profile = seasonProfile(hotStats);
+  const form = seasonForm(hotStats);
   const hotStatsLine = hotStats
-    ? `<div class="hot-stats ${verdict}" title="${esc(HOT_SEASON_NOTE)}">
-        <span class="hs-label">赛季火热</span>
-        <span class="hs-count"><b>${hotStats.hotGames}</b>/${hotStats.games} 场</span>
-        <span class="hs-verdict">${
-          verdict === 'stable'
-            ? `稳定 · 已达 ${state.hotThreshold} 场`
-            : verdict === 'flash'
-              ? '昙花一现'
-              : '尚未达标'
+    ? `<div class="hot-stats ${profile ? profile.tone : 'plain'}" title="${esc(HOT_SEASON_NOTE)}">
+        <span class="hs-label">${profile ? esc(profile.label) : '赛季火热'}</span>
+        <span class="hs-count"><b>${hotStats.hotGames}</b>/${hotStats.games} 场${
+          hotStats.badGames ? ` · 差 ${hotStats.badGames}` : ''
         }</span>
+        ${
+          form
+            ? `<span class="hs-form ${form.tone}" title="${esc(
+                `近 ${form.games} 场：${form.good} 场打得好 / ${form.bad} 场打得差`
+              )}">近${form.games}场 ${form.good}好${form.bad ? form.bad + '差' : ''}${
+                form.key === 'sample' ? '' : ' · ' + esc(form.label)
+              }</span>`
+            : ''
+        }
       </div>`
     : row.played && state.hotStatsLoading
       ? `<div class="hot-stats pending" title="正在拉取该球员本赛季的逐场数据">
@@ -3728,7 +3878,15 @@ function cardHTML({ row, rank, isTop, leaderBadge }) {
     isTop ? ' is-top' : ''
   }${row.hot ? ' is-hot' : ''}" style="--team-color:${color}" title="${esc(
     player.name
-  )}${hotLabel ? ' · 打得好：' + esc(hotLabel) : row.dq ? ' · 不计入打得好：' + esc(row.dq) : ''}">
+  )}${
+    hotLabel
+      ? ' · 打得好：' + esc(hotLabel)
+      : row.bad
+        ? ' · 打得差：' + esc(row.bad)
+        : row.dq
+          ? ' · 未达打得好门槛：' + esc(row.dq)
+          : ''
+  }">
     <div class="card-head">
       ${avatarHTML(player, { color, rank })}
       <div class="who">
@@ -3963,8 +4121,8 @@ function visibleRows() {
     if (state.filterStatus === 'resting' && !(row.state === 'live' && row.onCourt === false)) return false;
     if (state.filterStatus === 'hot' && !row.hot?.length) return false;
     if (state.filterStatus === 'bag' && playerGroup(row.player) !== 'bag') return false;
-    if (state.filterStatus === 'stable' && hotVerdict(hotStatsFor(row.player.id)) !== 'stable') return false;
-    if (state.filterStatus === 'flash' && hotVerdict(hotStatsFor(row.player.id)) !== 'flash') return false;
+    if (state.filterStatus === 'stable' && !isStableRow(row)) return false;
+    if (state.filterStatus === 'flash' && seasonProfile(hotStatsFor(row.player.id))?.key !== 'flash') return false;
     if (state.filterStatus === 'bench' && row.state !== 'bench') return false;
     if (state.filterStatus === 'idle' && row.state !== 'idle') return false;
     if (state.filterTeam !== 'all' && String(row.player.teamId) !== String(state.filterTeam)) return false;

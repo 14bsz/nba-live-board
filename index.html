@@ -114,10 +114,15 @@
             <span>排序</span>
             <select id="sortSelect"></select>
           </label>
-          <label class="field threshold-field" title="赛季火热场次达到该值算「稳定」，否则算「昙花一现」">
+          <div class="field threshold-field" title="赛季火热要求：打得好场次 ≥ 阈值，且占出场场次 ≥50%">
             <span>火热阈值</span>
-            <input id="hotThreshold" type="number" min="1" max="30" step="1" value="5">
-          </label>
+            <div class="threshold-control" id="thresholdPresets" role="group" aria-label="阈值预设">
+              <button type="button" class="threshold-preset" data-threshold="20" aria-pressed="false">严格</button>
+              <button type="button" class="threshold-preset active" data-threshold="10" aria-pressed="true">平衡</button>
+              <button type="button" class="threshold-preset" data-threshold="5" aria-pressed="false">宽松</button>
+              <input id="hotThreshold" type="number" min="1" max="30" step="1" value="10" aria-label="火热阈值（场次）">
+            </div>
+          </div>
           <button id="sortDirBtn" class="icon-btn small" title="切换升降序" aria-label="切换升降序">↓</button>
           <span class="updated" id="updatedAt">加载中…</span>
         </div>
