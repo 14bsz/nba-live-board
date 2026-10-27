@@ -900,6 +900,7 @@ function bindEvents() {
   });
 
   el.playerModalClose.addEventListener('click', closePlayerModal);
+  el.playerModalBody.addEventListener('click', onPlogRowClick);
   el.playerModal.addEventListener('click', (event) => {
     if (event.target === el.playerModal) closePlayerModal();
   });
@@ -3079,10 +3080,19 @@ const HOT_KEY_SHORT = {
 };
 
 let playerModalTrigger = null;
+// 当前弹窗里的球员：展开某一场时要靠他的 id / 球队去 summary 里取那场的 boxscore
+let playerModalPlayer = null;
+// 当前展开的比赛 id，同一时间只展开一场
+let plogOpenEvent = null;
+// 已取到的单场技术统计；只缓存成功结果，失败可以再点一次重试
+const plogGameStats = new Map();
+const PLOG_CACHE_LIMIT = 30;
 
 function openPlayerModal(playerId) {
   const player = state.players.find((p) => String(p.id) === String(playerId));
   if (!player) return;
+  playerModalPlayer = player;
+  plogOpenEvent = null;
   const stats = hotStatsFor(playerId);
   const name = displayName(player);
   const teamName = cnTeam(player.teamAbbr) || player.teamAbbr || '';
@@ -3106,6 +3116,8 @@ function closePlayerModal() {
   el.playerModalBody.innerHTML = '';
   const trigger = playerModalTrigger;
   playerModalTrigger = null;
+  playerModalPlayer = null;
+  plogOpenEvent = null;
   if (el.modal.hidden && el.rosterModal.hidden && el.authModal.hidden) {
     document.body.classList.remove('modal-open');
   }
@@ -3147,7 +3159,9 @@ function playerLogHTML(stats) {
       } else {
         verdict = '<span class="plog-tag none">—</span>';
       }
-      return `<div class="plog-row${game.hot ? ' is-hot' : ''}">
+      return `<button type="button" class="plog-row${game.hot ? ' is-hot' : ''}" data-plog-event="${esc(
+        game.e || ''
+      )}" aria-expanded="false" title="查看该场完整数据">
         <span class="plog-date">${esc(date)}</span>
         <span class="plog-opp">${esc(opp)}</span>
         <span class="plog-score">${esc(score)}${res}</span>
@@ -3156,7 +3170,7 @@ function playerLogHTML(stats) {
         <span class="plog-min">${game.min}</span>
         <span class="plog-ts">${esc(tsText)}</span>
         <span>${verdict}</span>
-      </div>`;
+      </button>`;
     })
     .join('');
 
@@ -3175,7 +3189,121 @@ function playerLogHTML(stats) {
   ).toFixed(1)}</b> 分 / <b>${avg('reb').toFixed(1)}</b> 板 / <b>${avg('ast').toFixed(1)}</b> 助 · TS <b>${
     tsAvg == null ? '—' : tsAvg.toFixed(1) + '%'
   }</b></p>
+    <p class="plog-hint">点任意一场展开该场完整数据</p>
     <div class="plog-list">${head}${body}</div>`;
+}
+
+/* ---------- 逐场明细：展开某一场的完整数据 ---------- */
+
+function onPlogRowClick(event) {
+  const row = event.target.closest('[data-plog-event]');
+  if (!row || !playerModalPlayer) return;
+  const eventId = row.dataset.plogEvent;
+  if (!eventId) return;
+  const player = playerModalPlayer;
+  const game = (hotStatsFor(player.id)?.log || []).find((item) => String(item.e) === eventId);
+
+  if (plogOpenEvent === eventId) {
+    const panel = row.nextElementSibling;
+    if (panel?.classList.contains('is-error')) {
+      // 上次没拉下来，点同一行当作重试
+      panel.remove();
+      showPlogDetail(row, player, game, eventId);
+    } else {
+      collapsePlogRow(row);
+    }
+    return;
+  }
+
+  const opened = el.playerModalBody.querySelector('.plog-row.is-open');
+  if (opened) collapsePlogRow(opened);
+
+  row.classList.add('is-open');
+  row.setAttribute('aria-expanded', 'true');
+  plogOpenEvent = eventId;
+  showPlogDetail(row, player, game, eventId);
+}
+
+function collapsePlogRow(row) {
+  const panel = row.nextElementSibling;
+  if (panel?.classList.contains('plog-detail')) panel.remove();
+  row.classList.remove('is-open');
+  row.setAttribute('aria-expanded', 'false');
+  plogOpenEvent = null;
+}
+
+async function showPlogDetail(row, player, game, eventId) {
+  const panel = document.createElement('div');
+  panel.className = 'plog-detail is-pending';
+  panel.innerHTML = '<span class="plog-detail-note">正在拉取该场技术统计…</span>';
+  row.after(panel);
+
+  let stats = plogGameStats.get(eventId);
+  if (stats === undefined) {
+    try {
+      stats = await loadGameStats(player, eventId);
+    } catch (error) {
+      stats = null;
+    }
+    if (stats) rememberPlogStats(eventId, stats);
+  }
+
+  // 请求期间可能已经折叠、换了一场，或者弹窗关了
+  if (!panel.isConnected || plogOpenEvent !== eventId) return;
+
+  if (!stats) {
+    panel.className = 'plog-detail is-error';
+    panel.innerHTML = '<span class="plog-detail-note">该场技术统计拉取失败，点这一行重试</span>';
+    return;
+  }
+  panel.className = 'plog-detail';
+  panel.innerHTML = plogDetailHTML(game, stats);
+}
+
+/** 逐场明细只有分/板/助等基础项，完整数据要去该场的 boxscore 取 */
+async function loadGameStats(player, eventId) {
+  const cached = state.summaries.get(eventId);
+  const fromCache = cached ? findPlayerGameStats(cached, player) : null;
+  if (fromCache) return fromCache;
+  const summary = await fetchJSON(API.summary(eventId));
+  return findPlayerGameStats(summary, player);
+}
+
+/** 球员赛季中期换过队，当前球队里找不到时再扫一遍两队的技术统计 */
+function findPlayerGameStats(summary, player) {
+  const playerId = String(player.id);
+  const teamIds = [];
+  if (player.teamId) teamIds.push(String(player.teamId));
+  for (const box of summary?.boxscore?.players || []) {
+    const id = box?.team?.id;
+    if (id != null && !teamIds.includes(String(id))) teamIds.push(String(id));
+  }
+  for (const teamId of teamIds) {
+    const stats = extractStats(summary, teamId, playerId);
+    if (stats && stats.minutes > 0) return stats;
+  }
+  return null;
+}
+
+function rememberPlogStats(eventId, stats) {
+  if (plogGameStats.size >= PLOG_CACHE_LIMIT) {
+    plogGameStats.delete(plogGameStats.keys().next().value);
+  }
+  plogGameStats.set(eventId, stats);
+}
+
+/** 与当日卡片同一套格子，只是不跟随当前排序高亮 */
+function plogDetailHTML(game, stats) {
+  const reasons = (game?.k || []).map((key) => ({ key }));
+  const pmHit = reasons.some((reason) => reason.key === 'pm');
+  return `<div class="stats">${statCells(stats, reasons, { sorted: false })}</div>
+    ${advCells(stats, reasons, { sorted: false })}
+    <div class="card-foot">
+      <span>投篮 ${stats.fgm}-${stats.fga} · 三分 ${stats.tpm}-${stats.tpa} · 罚球 ${stats.ftm}-${stats.fta}</span>
+      <span class="foot-sub">前板 ${stats.oreb} · 后板 ${stats.dreb} · 失误 ${stats.tov} · <span class="foot-item${
+        pmHit ? ' hit' : ''
+      }">正负 ${esc(fmtSigned(stats.plusMinus))}</span></span>
+    </div>`;
 }
 
 function rosterGameStatus(game) {  const meta = state.gameMeta.get(game.id) || {};
@@ -3695,7 +3823,7 @@ function hitCells(stats, reasons) {
   return hit;
 }
 
-function statCells(stats, reasons) {
+function statCells(stats, reasons, options) {
   return statGrid(
     [
       ['points', '得分', stats.pts],
@@ -3705,7 +3833,8 @@ function statCells(stats, reasons) {
       ['blocks', '盖帽', stats.blk],
       ['minutes', '分钟', Math.round(stats.minutes)],
     ],
-    hitCells(stats, reasons)
+    hitCells(stats, reasons),
+    options
   );
 }
 
@@ -3720,18 +3849,18 @@ function emptyStatCells() {
   ]);
 }
 
-function statGrid(cells, hit) {
+function statGrid(cells, hit, { sorted = true } = {}) {
   return cells
     .map(([key, label, value]) => {
       const classes = ['stat'];
-      if (state.sortKey === key) classes.push('main');
+      if (sorted && state.sortKey === key) classes.push('main');
       if (hit && hit.has(key)) classes.push('hit');
       return `<div class="${classes.join(' ')}"><b>${value}</b><span>${label}</span></div>`;
     })
     .join('');
 }
 
-function advCells(stats, reasons) {
+function advCells(stats, reasons, { sorted = true } = {}) {
   const hitKeys = new Set((reasons || []).map((reason) => reason.key));
   const cells = [
     {
@@ -3783,7 +3912,9 @@ function advCells(stats, reasons) {
       (cell) =>
         `<div class="adv-cell${cell.tone ? ' ' + cell.tone : ''}${
           cell.hit ? ' hit' : ''
-        }${state.sortKey === cell.key ? ' focus' : ''}" title="${esc(cell.title)}"><span>${cell.label}</span><b>${cell.value}</b></div>`
+        }${sorted && state.sortKey === cell.key ? ' focus' : ''}" title="${esc(cell.title)}"><span>${
+          cell.label
+        }</span><b>${cell.value}</b></div>`
     )
     .join('')}</div>`;
 }

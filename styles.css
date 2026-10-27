@@ -2508,6 +2508,87 @@ body.hscroll-dragging * {
   color: var(--muted);
 }
 
+.plog-hint {
+  margin: -4px 0 8px;
+  font-size: 10.5px;
+  color: var(--dim);
+}
+
+/* 每一场都能点开看完整数据，行本身是按钮 */
+button.plog-row {
+  width: 100%;
+  border: 0;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+button.plog-row:focus-visible {
+  outline: 1px solid rgba(255, 154, 61, 0.55);
+  outline-offset: -1px;
+}
+
+button.plog-row.is-open {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+}
+
+button.plog-row.is-open.is-hot {
+  background: rgba(255, 122, 26, 0.16);
+}
+
+/* 展开后的该场完整数据：与当日卡片同一套格子 */
+.plog-detail {
+  margin: 0 0 4px;
+  padding: 8px 10px 6px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: inset 2px 0 0 var(--accent);
+  animation: plog-detail-in 0.16s ease;
+}
+
+.plog-detail.is-pending,
+.plog-detail.is-error {
+  box-shadow: none;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.plog-detail-note {
+  display: block;
+  padding: 2px 0;
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.plog-detail.is-error .plog-detail-note {
+  color: #f09595;
+}
+
+.plog-detail .stats {
+  margin-top: 0;
+}
+
+.plog-detail .adv {
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+.plog-detail .card-foot {
+  margin-top: 8px;
+}
+
+@keyframes plog-detail-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 @media (max-width: 560px) {
   .plog-row {
     grid-template-columns: 36px minmax(0, 1fr) 76px 64px 36px 30px 34px 54px;
